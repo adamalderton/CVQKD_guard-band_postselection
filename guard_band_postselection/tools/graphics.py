@@ -1,7 +1,7 @@
-from typing import Tuple
 import numpy as np
 import matplotlib
 import matplotlib.pyplot as plt
+from typing import Tuple
 from mrmustard import settings
 from mrmustard.physics.fock import quadrature_distribution
 from mrmustard.utils.wigner import wigner_discretized
@@ -14,7 +14,7 @@ matplotlib.rcParams.update({
     'pgf.rcfonts': False,
 })
 
-def _wigner_and_rho_plot(
+def _wigner_and_rho_to_fig_ax(
     rho: np.ndarray,
     xbounds: Tuple[int] = (-6, 6),
     ybounds: Tuple[int] = (-6, 6),
@@ -144,12 +144,29 @@ def wigner_and_rho_plot_to_pgf(filename: str, rho: np.ndarray, **kwargs):
             The density matrix to plot.
         
         **kwargs: dict
-            Keyword arguments to pass to the _wigner_and_rho_plot function.
+            Keyword arguments to pass to the _wigner_and_rho_to_fig_ax function.
     
     Returns:
         None (saves the file to the specified location)
     """
 
-    fig, ax = _wigner_and_rho_plot(rho, **kwargs)
+    fig, ax = _wigner_and_rho_to_fig_ax(rho, **kwargs)
     fig.savefig(filename, bbox_inches = 'tight')
 
+def wigner_and_rho_plot(rho: np.ndarray, **kwargs):
+    """
+    Shows a plot of the Wigner function, the x and p quadrature marginals and the density matrix when given a density matrix.
+
+    Arguments:
+        rho: np.ndarray
+            The density matrix to plot.
+        
+        **kwargs: dict
+            Keyword arguments to pass to the _wigner_and_rho_to_fig_ax function.
+    
+    Returns:
+        None (shows the plot)
+    """
+
+    fig, ax = _wigner_and_rho_to_fig_ax(rho, **kwargs)
+    plt.show()
