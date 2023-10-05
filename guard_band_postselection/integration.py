@@ -1,6 +1,5 @@
 import numpy as np
 from scipy.integrate import dblquad
-from scipy.stats import norm
 
 class integrator():
     pass
