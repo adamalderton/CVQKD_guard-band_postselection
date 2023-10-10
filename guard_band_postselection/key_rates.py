@@ -27,13 +27,16 @@ class sec_no_post_selection_key_rate(quantum_statistics):
                     An array holding the edges of each interval, from left to right. 
                     That is, the first interval is -np.inf and the last is np.inf.
                     Of course, the non-extremal values of the array should be finite and in ascending order.
-            
+                    The interval edges should be given in units of standard deviation. That is, an interval which is one standard deviation from the mean would have a value of 1.0.
+                    
             Returns:
                 key_rate: float
                     The key rate for the given number of slices and interval edge positions.
         """
-        quantisation_entropy = self._evaluate_quantisation_entropy(m, interval_edges)
-        error_correction_information = self._evaluate_error_correction_information(m, interval_edges)
+        integrator = sliced_error_correction_integrator(m, interval_edges)
+        
+        quantisation_entropy = integrator.evaluate_slicing_entropy(m, interval_edges)
+        error_correction_information = integrator.evaluate_error_correction_information(m, interval_edges)
 
         return ((quantisation_entropy - error_correction_information) / self.mutual_information) * (self.mutual_information - self.holevo_information)
 
@@ -73,6 +76,9 @@ if __name__ == "__main__":
     T = 0.4
     xi = 0.05
 
-    print(sec_no_post_selection_key_rate(v_mod, T, xi).evaluate())
+    m = 1
+    interval_edges = np.array([-np.inf, 0.0, np.inf])
+
+    print(sec_no_post_selection_key_rate(v_mod, T, xi).evaluate(m, interval_edges))
 
     
