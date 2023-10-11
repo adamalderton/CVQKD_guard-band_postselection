@@ -5,10 +5,10 @@ from scipy.stats import norm
 # For now, we'll just use norm from scipy.stats.
 
 class quantum_statistics():
-    def __init__(self, v_mod, transmittance, excess_noise):
+    def __init__(self, V_mod, transmittance, excess_noise):
         """
         Class arguments:
-            v_mod: Alice's modulation variance $V_\\text{mod}$.
+            V_mod: Alice's modulation variance $V_\\text{mod}$.
             trans: Transmissivity $T$ of the channel.
             excess_noise: Excess noise $\\xi$ of the channel.
         """
@@ -16,18 +16,18 @@ class quantum_statistics():
         # TODO: Make variance parameters here immutable by making them properties of the class. Hopefully underscore prefixes are enough for now.
 
         # With channel parameters passed, we can digest other relevant parameters.
-        self.v_mod = v_mod
+        self.V_mod = V_mod
         self.T = transmittance
         self.xi = excess_noise
 
-        self._v_A = v_mod + 1.0                             # Alice's effective variance $V_A = $V_\\text{mod} + 1$ in SNU.
-        self._v_B = (self.T * self.v_mod) + 1 + self.xi     # Bob's effective variance $V_B = T V_\\text{mod} + 1 + \\xi$ in SNU.
+        self.V_A = V_mod + 1.0                             # Alice's effective variance $V_A = $V_\\text{mod} + 1$ in SNU.
+        self.V_B = (self.T * self.V_mod) + 1 + self.xi     # Bob's effective variance $V_B = T V_\\text{mod} + 1 + \\xi$ in SNU.
 
         # Covariance matrix parameters. See first year report or (Laudenbach-2018) for details.
         # In short, $a$ is Alice's variance, $b$ is Bob's variance and $c$ is the cross-correlation term.
-        self._a = self._v_A
-        self._b = self._v_B
-        self._c = np.sqrt(self.T * (self._v_A*self._v_A - 1))
+        self._a = self.V_A
+        self._b = self.V_B
+        self._c = np.sqrt(self.T * (self.V_A*self.V_A - 1))
 
         # We can then use these to build the 4x4 covariance matrix:
         #
@@ -49,8 +49,9 @@ class quantum_statistics():
         self._sqrt_cov_mat_det = np.sqrt(self._cov_mat_det)
 
         # Initialise instances of scipy.stats.norm objects for Alice and Bob.
-        self.alice_norm = norm(loc = 0.0, scale = np.sqrt(self._v_A))
-        self.bob_norm   = norm(loc = 0.0, scale = np.sqrt(self._v_B))
+        # Stats can then be gathered via self.alice_norm.pdf, for example.
+        self.alice_norm = norm(loc = 0.0, scale = np.sqrt(self.V_A))
+        self.bob_norm   = norm(loc = 0.0, scale = np.sqrt(self.V_B))
 
 
 
