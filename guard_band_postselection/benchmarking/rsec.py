@@ -1,2 +1,0 @@
-# TODO: Will need to use parts from multidimensional.py and integration (the non guard band part) to do this.
-# TODO: Potentially incorporate guard band postselection and RSEC! Should be easy to do if the rest of this project is implemented well.

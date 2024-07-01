@@ -4,12 +4,7 @@ from scipy.integrate import dblquad
 
 from .quantum_statistics import quantum_statistics
 
-# TODO: Generalise classes below into this.
-# class integrator():
-#     pass
-
-# class guard_band_postselection_sliced_integrator(integrator):
-#     pass
+# TODO: DO ONE FOR MSB AND ONE FOR LSB
 
 class sliced_error_correction_integrator():
     def __init__(self, m, interval_edges, alice_variance, bob_variance, cross_correlation):
