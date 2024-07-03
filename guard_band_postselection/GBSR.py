@@ -1,53 +1,62 @@
 import numpy as np
 import sympy as sp
+from numba import njit
 from scipy.stats import norm
 
-class GBSR():
-    def __init__(self, V_mod, transmittance, excess_noise) -> None:
+class GBSR_quantum_statistics():
+    def __init__(self, modulation_variance, transmittance, excess_noise) -> None:
         """
         Class arguments:
-            V_mod: Alice's modulation variance $V_\\text{mod}$.
-            trans: Transmissivity $T$ of the channel.
+            modulation_variance: Alice's modulation variance $V_\\text{mod}$.
+            transmittance: Transmissivity $T$ of the channel.
             excess_noise: Excess noise $\\xi$ of the channel.
         """
 
-        # With channel parameters passed, we can digest other relevant parameters.
-        self.V_mod = V_mod
-        self.T = transmittance
-        self.xi = excess_noise
+        self.modulation_variance = modulation_variance
+        self.transmittance = transmittance
+        self.excess_noise = excess_noise
 
-        self.V_A = V_mod + 1.0                             # Alice's effective variance $V_A = $V_\\text{mod} + 1$ in SNU.
-        self.V_B = (self.T * self.V_mod) + 1 + self.xi     # Bob's effective variance $V_B = T V_\\text{mod} + 1 + \\xi$ in SNU.
+        self.alice_variance = modulation_variance + 1.0                              # Alice's effective variance $V_A = $V_\\text{mod} + 1$ in SNU.
+        self.bob_variance = (transmittance * modulation_variance) + 1 + excess_noise # Bob's effective variance $V_B = T V_\\text{mod} + 1 + \\xi$ in SNU.
 
-        # Covariance matrix parameters. See first year report or (Laudenbach-2018) for details.
-        # In short, $a$ is Alice's variance, $b$ is Bob's variance and $c$ is the cross-correlation term.
-        self._a = self.V_A
-        self._b = self.V_B
-        self._c = np.sqrt(self.T * (self.V_A*self.V_A - 1))
+        # Initialise covariance matrix and its coefficients a, b and c using sympy. Numerical values can be substituted in later.
+        self.a_sym, self.b_sym, self.c_sym = sp.symbols('a b c', real = True, positive = True)
 
-        # We can then use these to build the 4x4 covariance matrix:
-        #
-        #           
-        #               a\mathbb{I}_2  c\sigma_z
-        # cov_mat =  (                            )
-        #                c\sigma_z  b\mathbb{I}_2
-        #
-        #
-        self.cov_mat = np.array(
-            [
-                [self._a,       0,          self._c,         0],
-                [0,             self._a,    0,        -self._c],
-                [self._c,       0,          self._b,         0],
-                [0,             -self._c,   0,         self._b]
-            ]
+        self.cov_mat = sp.Matrix([
+            [self.a_sym, 0, self.c_sym, 0],
+            [0, self.a_sym, 0, -self.c_sym],
+            [self.c_sym, 0, self.b_sym, 0],
+            [0, -self.c_sym, 0, self.b_sym]
+        ])
+    
+        # Define symbols for Alice and Bob's coherent states.
+        self.alpha_sym, self.beta_sym = sp.symbols('alpha beta', complex = True)
+
+        # Define the Husimi-Q function of a TMSV vacuum state, subject to no post-selection, in sympy.
+        self.Q_star = (sp.sqrt(self.cov_mat.det()) / sp.pi**2) * sp.exp(-self.a_sym * (sp.Abs(self.alpha_sym))**2 - self.b_sym * sp.Abs(self.beta_sym)**2 - 2 * self.c_sym * sp.Abs(self.alpha_sym) * sp.Abs(self.beta_sym) * sp.cos(sp.arg(self.alpha_sym) - sp.arg(self.beta_sym)))
+
+        # Generate the Q_star lambda function with, a, b and c as parameters. This must be updated when a, b and c change.
+        # This should probably be done as a class property but it's likely just me using this code so this is probably okay.
+        self.Q_star_lambda = self.generate_Q_star_lambda(
+            self.alice_variance,
+            self.bob_variance,
+            np.sqrt(self.transmittance * (self.alice_variance*self.alice_variance - 1))
         )
-        self._cov_mat_det = np.linalg.det(self.cov_mat)
-        self._sqrt_cov_mat_det = np.sqrt(self._cov_mat_det)
 
-        # Initialise instances of scipy.stats.norm objects for Alice and Bob.
-        # Stats can then be gathered via self.alice_norm.pdf, for example.
-        self.alice_norm = norm(loc = 0.0, scale = np.sqrt(self.V_A))
-        self.bob_norm   = norm(loc = 0.0, scale = np.sqrt(self.V_B))
+    def generate_Q_star_lambda(self, a, b, c):
+        """
+        Generate the Q function for a given covariance matrix in a lambda function, that is JIT compiled.
+        """
+        return njit(
+            sp.lambdify(
+                (self.alpha_sym, self.beta_sym), # Function arguments
+                self.Q_star.subs([(self.a_sym, a), (self.b_sym, b), (self.c_sym, c)]),
+            )
+        )
+
+class GBSR(GBSR_quantum_statistics):
+    def __init__(self) -> None:
+        super().__init__()
 
     def evaluate_key_rate_in_bits_per_pulse(self, m: int, interval_edges: list, gb_widths: list[list, list]):
         """
@@ -75,7 +84,7 @@ class GBSR():
 
         return ((quantisation_entropy - leaked_classical_information) / self.mutual_information) * (self.mutual_information - self.holevo_information)
 
-    def _evaluate_mutual_information(self):
+        def _evaluate_mutual_information(self):
         """
             Evaluate the mutual information between Alice and Bob's probability distributions.
             This will later be done via numerical integration but the known analytical form can be read off for now.
