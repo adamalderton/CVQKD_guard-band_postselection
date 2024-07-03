@@ -1,19 +1,15 @@
 import numpy as np
+import sympy as sp
 from scipy.stats import norm
 
-# TODO: Fill out use of mrmustard for rigorous introduction of statistics. That is, proper marginals calculated from the proper Q function.
-# For now, we'll just use norm from scipy.stats.
-
-class quantum_statistics():
-    def __init__(self, V_mod, transmittance, excess_noise):
+class GBSR():
+    def __init__(self, V_mod, transmittance, excess_noise) -> None:
         """
         Class arguments:
             V_mod: Alice's modulation variance $V_\\text{mod}$.
             trans: Transmissivity $T$ of the channel.
             excess_noise: Excess noise $\\xi$ of the channel.
         """
-
-        # TODO: Make variance parameters here immutable by making them properties of the class. Hopefully underscore prefixes are enough for now.
 
         # With channel parameters passed, we can digest other relevant parameters.
         self.V_mod = V_mod
@@ -53,40 +49,31 @@ class quantum_statistics():
         self.alice_norm = norm(loc = 0.0, scale = np.sqrt(self.V_A))
         self.bob_norm   = norm(loc = 0.0, scale = np.sqrt(self.V_B))
 
-
-class sec_no_post_selection_key_rate(quantum_statistics):
-    def __init__(self, v_mod, transmittance, excess_noise):
+    def evaluate_key_rate_in_bits_per_pulse(self, m: int, interval_edges: list, gb_widths: list[list, list]):
         """
-            Run quantum_statistics.__init__() to initialise appropriate parameters.
-        """
-        self.super().__init__(v_mod, transmittance, excess_noise)
-
-        self.mutual_information = self._evaluate_mutual_information()
-        self.holevo_information = self._evaluate_holevo_information()
-
-    def evaluate(self, m, interval_edges):
-        """
-            Evaluate the key rate for the no post-selection case (for now) with a given number of slices $m$ and an array holding each interval edge.
+            Evaluate the key rate for GBSR with a given number of slices $m$ and an array holding each interval edge, and a 2D array holding 
 
             Arguments:
                 m: integer
                     The number of slices.
-                interval_edges: array(flaot)
+                interval_edges: array(float)
                     An array holding the edges of each interval, from left to right. 
                     That is, the first interval is -np.inf and the last is np.inf.
                     Of course, the non-extremal values of the array should be finite and in ascending order.
                     The interval edges should be given in units of standard deviation. That is, an interval which is one standard deviation from the mean would have a value of 1.0.
+                gb_widths: array(array(float))
+                    A 2D array holding the widths of the guard bands for each interval.
+                    The first index corresponds to the negative extent from the interval edge, and the second index corresponds to the positive extent.
                     
             Returns:
                 key_rate: float
                     The key rate for the given number of slices and interval edge positions.
         """
-        integrator = sliced_error_correction_integrator(m, interval_edges)
         
         quantisation_entropy = integrator.evaluate_slicing_entropy(m, interval_edges)
-        error_correction_information = integrator.evaluate_error_correction_information(m, interval_edges)
+        leaked_classical_information = integrator.evaluate_error_correction_information(m, interval_edges)
 
-        return ((quantisation_entropy - error_correction_information) / self.mutual_information) * (self.mutual_information - self.holevo_information)
+        return ((quantisation_entropy - leaked_classical_information) / self.mutual_information) * (self.mutual_information - self.holevo_information)
 
     def _evaluate_mutual_information(self):
         """
