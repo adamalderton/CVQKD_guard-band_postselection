@@ -1,7 +1,7 @@
 import numpy as np
 import sympy as sp
 from numba import njit
-from scipy.stats import norm
+from scipy.integrate import nquad
 
 class GBSR_quantum_statistics():
     def __init__(self, modulation_variance, transmittance, excess_noise) -> None:
@@ -33,31 +33,156 @@ class GBSR_quantum_statistics():
         self.alpha_sym, self.beta_sym = sp.symbols('alpha beta', complex = True)
 
         # Define the Husimi-Q function of a TMSV vacuum state, subject to no post-selection, in sympy.
-        self.Q_star = (sp.sqrt(self.cov_mat.det()) / sp.pi**2) * sp.exp(-self.a_sym * (sp.Abs(self.alpha_sym))**2 - self.b_sym * sp.Abs(self.beta_sym)**2 - 2 * self.c_sym * sp.Abs(self.alpha_sym) * sp.Abs(self.beta_sym) * sp.cos(sp.arg(self.alpha_sym) - sp.arg(self.beta_sym)))
+        self.Q_star_sym = (sp.sqrt(self.cov_mat.det()) / sp.pi**2) * sp.exp(-self.a_sym * (sp.Abs(self.alpha_sym))**2 - self.b_sym * sp.Abs(self.beta_sym)**2 - 2 * self.c_sym * sp.Abs(self.alpha_sym) * sp.Abs(self.beta_sym) * sp.cos(sp.arg(self.alpha_sym) - sp.arg(self.beta_sym)))
 
         # Generate the Q_star lambda function with, a, b and c as parameters. This must be updated when a, b and c change.
         # This should probably be done as a class property but it's likely just me using this code so this is probably okay.
-        self.Q_star_lambda = self.generate_Q_star_lambda(
+        self.Q_star_lambda = self._generate_Q_star_lambda(
             self.alice_variance,
             self.bob_variance,
             np.sqrt(self.transmittance * (self.alice_variance*self.alice_variance - 1))
         )
 
-    def generate_Q_star_lambda(self, a, b, c):
+        # Placeholder attributes for those that need to be evaluated with the specifics of the guard bands in mind.
+        self.F_sym = None       # Symbolic representation of the filter function $F(\beta)$.
+        self.p_pass = None      # Numerical value of the probability of passing the filter function.
+        self.pX = None          # Array containing marginal probability distribution values p(X = x).
+        self.pY = None          # Array containing marginal probability distribution values p(Y = y).
+        self.pXY = None         # 2D array containing joint probability distribution values p(X = x, Y = y).    
+
+    def _evaluate_p_pass(self, tau_arr, g_arr):
         """
-        Generate the Q function for a given covariance matrix in a lambda function, that is JIT compiled.
+        Evaluate the probability of passing the filter function.
+
+        Arguments:
+            F_sym: sympy expression
+                The filter function $F(\beta)$.
+            tau_arr: array(float)
+                An array holding the values of $\tau_i$.
+            g_arr: array(float)
+                An array holding the values of $g_{\pm, i}$. g[i, 0] contains $g_{i,-}$ and g[i, 1] contains $g_{i,+}$.
+        """
+        F = self._substitute_guard_band_properties_into_F(self.F_sym, tau_arr, g_arr)
+
+        return nquad(
+            njit( # Integrand
+                sp.lambdify(
+                    (self.alpha_sym, self.beta_sym),
+                    sp.simplify((self.F_sym * self.Q_star_sym)),
+                    "numpy"
+                )
+            ),
+            [[-np.inf, np.inf], [-np.inf, np.inf]] # Integration limits. This is the whole complex plane.
+        )
+
+    def _substitute_guard_band_properties_into_F(self, tau_arr, g_arr):
+        """
+        Substitute the guard band properties into the filter function $F(\beta)$.
+
+                Arguments:
+            F_sym: sympy expression
+                The filter function $F(\beta)$.
+            tau_arr: array(float)
+                An array holding the values of $\tau_i$.
+            g_arr: array(float)
+                An array holding the values of $g_{\pm, i}$. g[i, 0] contains $g_{i,-}$ and g[i, 1] contains $g_{i,+}$.
+        """
+        return self.F_sym.subs(
+            [(sp.Symbol(f'g_minus:{i}'), g_arr[i, 0]) for i in range(len(g_arr))] +
+            [(sp.Symbol(f'g_plus:{i}'), g_arr[i, 1]) for i in range(len(g_arr))] +
+            [(sp.Symbol(f'taus:{i}'), tau_arr[i]) for i in range(len(tau_arr))]
+        )
+
+    def _evaluate_marginals(self):
+        pass
+
+    def _define_filter_function(self, m):
+        """
+        Define the filter function $F(\beta)$ in sympy. This is done in a standalone function as it is quite an involved process.
+
+        F(\beta) = 
+            \begin{cases} 
+                0 & \text{if} \ \exists x \in \{\beta_\text{re}, \beta_\text{im}\} \ \text{such that} \\
+                  & \quad \forall i \in \{0, 1, \ldots, |\mathcal{T}|\}, g_{-,i} \leq (x - \tau_i) \leq g_{+,i} \\
+                1 & \text{otherwise}
+            \end{cases}
+
+        Arguments:
+            m: Integer.
+                The number of slices $m$. This produces a number of intervals $|T| = 2^m$, therefore there is $|T| + 1$ interval edges.
+        """
+        T = 2**m
+
+        # Define the sympy symbols. See paper for thorough definitions
+
+        g_minus = sp.symbols(f'g_minus:{T+1}')  # Creates g_minus_0, g_minus_1, ..., g_minus_T
+        g_plus = sp.symbols(f'g_plus:{T+1}')    # Creates g_plus_0, g_plus_1, ..., g_plus_T
+        taus = sp.symbols(f'taus:{T+1}')        # Creates taus_0, taus_1, ..., taus_T
+
+        # Construct the conditions
+        conditions = []
+        for i in range(T + 1):
+            conditions.append(sp.And(g_minus[i] <= (sp.re(self.beta_sym) - taus[i]), (sp.re(self.beta_sym) - taus[i]) <= g_plus[i]))
+            conditions.append(sp.And(g_minus[i] <= (sp.im(self.beta_sym) - taus[i]), (sp.im(self.beta_sym) - taus[i]) <= g_plus[i]))
+        
+        # Define the filter function. This unpacks conditions into essentially a huge OR statement.
+        F = sp.Piecewise(
+            (0, sp.Or(*conditions)),
+            (1, True)
+        )
+
+        return F
+
+    def _generate_Q_star_lambda(self, a, b, c):
+        """
+        Generate the Q function (subject to no post-selection, hence Q_star) for a given covariance matrix in a lambda function, that is JIT compiled.
         """
         return njit(
             sp.lambdify(
                 (self.alpha_sym, self.beta_sym), # Function arguments
-                self.Q_star.subs([(self.a_sym, a), (self.b_sym, b), (self.c_sym, c)]),
+                self.Q_star_sym.subs([(self.a_sym, a), (self.b_sym, b), (self.c_sym, c)]).simplify(),
+            )
+        )
+
+    def _generate_Q_PS_lambda(self, a, b, c, tau_arr, g_arr):
+        """
+        Generate the Q function (subject to post-selection, hence Q_PS) for a given covariance matrix in a lambda function, that is JIT compiled.
+
+        Arguments:
+            a: float
+                The coefficient $a$ of the covariance matrix.
+            b: float
+                The coefficient $b$ of the covariance matrix.
+            c: float
+                The coefficient $c$ of the covariance matrix.
+            tau_arr: array(float)
+                An array holding the values of $\tau_i$.
+            g_arr: array(float)
+                An array holding the values of $g_{\pm, i}$. g[i, 0] contains $g_{i,-}$ and g[i, 1] contains $g_{i,+}$.
+        """
+        
+        # First, substitute the numerical guard band properties into the filter function.
+        F = self._substitute_guard_band_properties_into_F(tau_arr, g_arr)
+
+        # Find p_pass
+        p_pass = self._evaluate_p_pass(tau_arr, g_arr)
+
+        # Return lambdified, compiled function.
+        return njit(
+            sp.lambdify(
+                (self.alpha_sym, self.beta_sym),                                                                      
+                (F * self.Q_star_sym.subs([(self.a_sym, a), (self.b_sym, b), (self.c_sym, c)]).simplify() / self.p_pass),
+                "numpy"
             )
         )
 
 class GBSR(GBSR_quantum_statistics):
-    def __init__(self) -> None:
+    def __init__(self, m) -> None:
         super().__init__()
 
+        self.F_sym = self._define_filter_function(m)
+        self.F_sym_subs = self._substitute_guard_band_properties_into_F(tau_arr, g_arr)
+        
     def evaluate_key_rate_in_bits_per_pulse(self, m: int, interval_edges: list, gb_widths: list[list, list]):
         """
             Evaluate the key rate for GBSR with a given number of slices $m$ and an array holding each interval edge, and a 2D array holding 
