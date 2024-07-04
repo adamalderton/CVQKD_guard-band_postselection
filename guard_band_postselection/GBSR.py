@@ -4,7 +4,7 @@ from numba import njit
 from scipy.integrate import nquad
 
 class GBSR_quantum_statistics():
-    def __init__(self, modulation_variance, transmittance, excess_noise) -> None:
+    def __init__(self, modulation_variance, transmittance, excess_noise, NJIT = True) -> None:
         """
         Class arguments:
             modulation_variance: Alice's modulation variance $V_\\text{mod}$.
@@ -15,6 +15,8 @@ class GBSR_quantum_statistics():
         self.modulation_variance = modulation_variance
         self.transmittance = transmittance
         self.excess_noise = excess_noise
+
+        self.NJIT = NJIT
 
         self.alice_variance = modulation_variance + 1.0                              # Alice's effective variance $V_A = $V_\\text{mod} + 1$ in SNU.
         self.bob_variance = (transmittance * modulation_variance) + 1 + excess_noise # Bob's effective variance $V_B = T V_\\text{mod} + 1 + \\xi$ in SNU.
@@ -31,6 +33,10 @@ class GBSR_quantum_statistics():
     
         # Define symbols for Alice and Bob's coherent states.
         self.alpha_sym, self.beta_sym = sp.symbols('alpha beta', complex = True)
+        
+        # Define symbols for the real and complex parts of Alice and Bob's coherent states.
+        self.alpha_re_sym, self.alpha_im_sym = sp.symbols('alpha_re alpha_im', real = True)
+        self.beta_re_sym, self.beta_im_sym = sp.symbols('beta_re beta_im', real = True)
 
         # Define the Husimi-Q function of a TMSV vacuum state, subject to no post-selection, in sympy.
         self.Q_star_sym = (sp.sqrt(self.cov_mat.det()) / sp.pi**2) * sp.exp(-self.a_sym * (sp.Abs(self.alpha_sym))**2 - self.b_sym * sp.Abs(self.beta_sym)**2 - 2 * self.c_sym * sp.Abs(self.alpha_sym) * sp.Abs(self.beta_sym) * sp.cos(sp.arg(self.alpha_sym) - sp.arg(self.beta_sym)))
@@ -46,6 +52,7 @@ class GBSR_quantum_statistics():
         # Placeholder attributes for those that need to be evaluated with the specifics of the guard bands in mind.
         self.F_sym = None       # Symbolic representation of the filter function $F(\beta)$.
         self.p_pass = None      # Numerical value of the probability of passing the filter function.
+        self.Q_PS_lambda = None # Lambda function for the Q function subject to post-selection.
         self.pX = None          # Array containing marginal probability distribution values p(X = x).
         self.pY = None          # Array containing marginal probability distribution values p(Y = y).
         self.pXY = None         # 2D array containing joint probability distribution values p(X = x, Y = y).    
@@ -64,16 +71,19 @@ class GBSR_quantum_statistics():
         """
         F = self._substitute_guard_band_properties_into_F(self.F_sym, tau_arr, g_arr)
 
-        return nquad(
-            njit( # Integrand
-                sp.lambdify(
-                    (self.alpha_sym, self.beta_sym),
-                    sp.simplify((self.F_sym * self.Q_star_sym)),
-                    "numpy"
-                )
-            ),
-            [[-np.inf, np.inf], [-np.inf, np.inf]] # Integration limits. This is the whole complex plane.
+        integrand = sp.lambdify(
+            (self.alpha_sym, self.beta_sym),
+            sp.simplify((self.F_sym * self.Q_star_sym)),
+            "numpy"
         )
+
+        if self.NJIT:
+            integrand = njit(integrand)
+
+        # Integrate integrand over the entire complex plane.
+        self.p_pass = nquad(integrand, [[-np.inf, np.inf], [-np.inf, np.inf]])
+
+        return self.p_pass
 
     def _substitute_guard_band_properties_into_F(self, tau_arr, g_arr):
         """
@@ -93,8 +103,46 @@ class GBSR_quantum_statistics():
             [(sp.Symbol(f'taus:{i}'), tau_arr[i]) for i in range(len(tau_arr))]
         )
 
-    def _evaluate_marginals(self):
+    def _evaluate_marginals(self, x_range, y_range, num_points):
+        """
+        Given the form of Q_PS (in a numerically integrable lambda function), evaluate the marginal probability distributions p(X = x), p(Y = y) and the joint probability distribution p(X = x, Y = y).
+        
+        Arguments:
+            x_range: array(float)
+                The range of values for X.
+            y_range: array(float)
+                The range of values for Y.
+            num_points: integer
+                The number of points to evaluate the probability distributions at.
+                For the joint probability distribution, this will be num_points^2, so be careful with large values.
+        """
         pass
+        # if self.Q_PS_lambda is None:
+        #     raise ValueError("The Q_PS lambda function has not been generated yet.")
+        
+        # # Initialise arrays
+        # self.X = np.zeros(num_points)
+        # self.Y = np.zeros(num_points)
+        # self.XY = np.zeros((num_points, num_points))
+        # self.pX = np.zeros(num_points)
+        # self.pY = np.zeros(num_points)
+        # self.pXY = np.zeros((num_points, num_points))
+        
+        # # Write x and y values into the first columns of pX and pY respectively.
+        # self.X = np.linspace(x_range[0], x_range[1], num_points)
+        # self.Y = np.linspace(y_range[0], y_range[1], num_points)
+        # self.XY = np.meshgrid(self.X, self.Y)
+
+        # # Distances between points. Useful for normalisation later.
+        # dx = self.X[1] - self.X[0]
+        # dy = self.Y[1] - self.Y[0]
+
+        # # Carry out the following integration: p(X, Y) &= \int \! d\alpha_\text{re} \int \! d\beta_\text{re} Q_{\text{PS}}(\alpha, \beta).
+        # # Remember that \alpha and \beta are complex.
+        # for i, x in enumerate(self.X):
+        #     for j, y in enumerate(self.Y):
+        #         # Need to integrate over the real parts of alpha and beta, for this value of x and y.
+        #         self.pXY[i, j] = nquad(self.Q_PS_lambda, )
 
     def _define_filter_function(self, m):
         """
@@ -131,22 +179,46 @@ class GBSR_quantum_statistics():
             (1, True)
         )
 
-        return F
+        self.F_sym = F
+
+        return self.F_sym
 
     def _generate_Q_star_lambda(self, a, b, c):
         """
         Generate the Q function (subject to no post-selection, hence Q_star) for a given covariance matrix in a lambda function, that is JIT compiled.
+        IMPORTANT: Due to needing real integrands for scipy.integrate.nquad, the Q function is evaluated with the real and imaginary parts of alpha and beta as separate arguments.
+        That is, Q_star_lambda(alpha_re, alpha_im, beta_re, beta_im).
+
+        Arguments:
+            a: float
+                The coefficient $a$ of the covariance matrix.
+            b: float
+                The coefficient $b$ of the covariance matrix.
+            c: float
+                The coefficient $c$ of the covariance matrix.
         """
-        return njit(
-            sp.lambdify(
-                (self.alpha_sym, self.beta_sym), # Function arguments
-                self.Q_star_sym.subs([(self.a_sym, a), (self.b_sym, b), (self.c_sym, c)]).simplify(),
-            )
+        self.Q_star_lambda = sp.lambdify(
+            (self.alpha_re_sym, self.alpha_im_sym, self.beta_re_sym, self.beta_im_sym), # Function arguments
+            self.Q_star_sym.subs(
+                [
+                    (self.alpha_sym, self.alpha_re_sym + self.alpha_im_sym*1j), # alpha = alpha_re + i alpha_im
+                    (self.beta_sym, self.beta_re_sym + self.beta_im_sym*1j),    # beta = beta_re + i beta_im
+                    (self.a_sym, a),
+                    (self.b_sym, b),
+                    (self.c_sym, c)]
+            ).simplify(),
         )
+
+        if self.NJIT:
+            self.Q_star_lambda = njit(self.Q_star_lambda)
+
+        return self.Q_star_lambda
 
     def _generate_Q_PS_lambda(self, a, b, c, tau_arr, g_arr):
         """
         Generate the Q function (subject to post-selection, hence Q_PS) for a given covariance matrix in a lambda function, that is JIT compiled.
+        IMPORTANT: Due to needing real integrands for scipy.integrate.nquad, the Q function is evaluated with the real and imaginary parts of alpha and beta as separate arguments.
+        That is, Q_PS_lambda(alpha_re, alpha_im, beta_re, beta_im).
 
         Arguments:
             a: float
@@ -167,23 +239,38 @@ class GBSR_quantum_statistics():
         # Find p_pass
         p_pass = self._evaluate_p_pass(tau_arr, g_arr)
 
-        # Return lambdified, compiled function.
-        return njit(
-            sp.lambdify(
-                (self.alpha_sym, self.beta_sym),                                                                      
-                (F * self.Q_star_sym.subs([(self.a_sym, a), (self.b_sym, b), (self.c_sym, c)]).simplify() / self.p_pass),
-                "numpy"
-            )
+        # Therefore, the composite Q function in symbolic form
+        Q_PS = F * self.Q_star_sym / p_pass
+
+        # Substitute and lambdify
+        self.Q_PS_lambda = sp.lambdify(
+            (self.alpha_re_sym, self.alpha_im_sym, self.beta_re_sym, self.beta_im_sym),                                                                      
+            Q_PS.subs(
+                [
+                    (self.alpha_sym, self.alpha_re_sym + self.alpha_im_sym*1j), # alpha = alpha_re + i alpha_im
+                    (self.beta_sym, self.beta_re_sym + self.beta_im_sym*1j),    # beta = beta_re + i beta_im
+                    (self.a_sym, a),
+                    (self.b_sym, b),
+                    (self.c_sym, c)]
+            ).simplify(),
+            "numpy"
         )
+
+        if self.NJIT:
+            self.Q_PS_lambda = njit(self.Q_PS_lambda)
+
+        return self.Q_PS_lambda
 
 class GBSR(GBSR_quantum_statistics):
     def __init__(self, m) -> None:
         super().__init__()
 
-        self.F_sym = self._define_filter_function(m)
-        self.F_sym_subs = self._substitute_guard_band_properties_into_F(tau_arr, g_arr)
+        #self.F_sym = self._define_filter_function(m)
+        #self.F_sym_subs = self._substitute_guard_band_properties_into_F(tau_arr, g_arr)
+
+        #self.Q_PS_lambda = self._generate_Q_PS_lambda(a, b, c, tau_arr, g_arr)
         
-    def evaluate_key_rate_in_bits_per_pulse(self, m: int, interval_edges: list, gb_widths: list[list, list]):
+    def evaluate_key_rate_in_bits_per_pulse(self, m, tau_arr, g_arr):
         """
             Evaluate the key rate for GBSR with a given number of slices $m$ and an array holding each interval edge, and a 2D array holding 
 
@@ -203,13 +290,13 @@ class GBSR(GBSR_quantum_statistics):
                 key_rate: float
                     The key rate for the given number of slices and interval edge positions.
         """
-        
-        quantisation_entropy = integrator.evaluate_slicing_entropy(m, interval_edges)
-        leaked_classical_information = integrator.evaluate_error_correction_information(m, interval_edges)
+        pass
+        #quantisation_entropy = integrator.evaluate_slicing_entropy(m, interval_edges)
+        #leaked_classical_information = integrator.evaluate_error_correction_information(m, interval_edges)
 
-        return ((quantisation_entropy - leaked_classical_information) / self.mutual_information) * (self.mutual_information - self.holevo_information)
+        #return ((quantisation_entropy - leaked_classical_information) / self.mutual_information) * (self.mutual_information - self.holevo_information)
 
-        def _evaluate_mutual_information(self):
+    def _evaluate_mutual_information(self):
         """
             Evaluate the mutual information between Alice and Bob's probability distributions.
             This will later be done via numerical integration but the known analytical form can be read off for now.
