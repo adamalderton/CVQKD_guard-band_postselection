@@ -1,7 +1,8 @@
 import numpy as np
 import sympy as sp
-from numba import njit
+from numba import njit, prange
 from scipy.integrate import nquad
+import time
 
 class GBSR_quantum_statistics():
     def __init__(self, modulation_variance, transmittance, excess_noise, NJIT = True) -> None:
@@ -105,6 +106,15 @@ class GBSR_quantum_statistics():
 
     def _evaluate_marginals(self, x_range, y_range, num_points):
         """
+            Wrapper function for _evaluate_marginals_uncompiled. This function is JIT compiled if the NJIT flag is set to True.
+        """
+        if self.NJIT:
+            return njit(self._evaluate_marginals_uncompiled, parallel = True)(x_range, y_range, num_points)
+        
+        return self._evaluate_marginals_uncompiled(x_range, y_range, num_points)
+    
+    def _evaluate_marginals_uncompiled(self, x_range, y_range, num_points):
+        """
         Given the form of Q_PS (in a numerically integrable lambda function), evaluate the marginal probability distributions p(X = x), p(Y = y) and the joint probability distribution p(X = x, Y = y).
         
         Arguments:
@@ -116,33 +126,51 @@ class GBSR_quantum_statistics():
                 The number of points to evaluate the probability distributions at.
                 For the joint probability distribution, this will be num_points^2, so be careful with large values.
         """
-        pass
-        # if self.Q_PS_lambda is None:
-        #     raise ValueError("The Q_PS lambda function has not been generated yet.")
+        if self.Q_PS_lambda is None:
+            raise ValueError("The Q_PS lambda function has not been generated yet.")
         
-        # # Initialise arrays
-        # self.X = np.zeros(num_points)
-        # self.Y = np.zeros(num_points)
-        # self.XY = np.zeros((num_points, num_points))
-        # self.pX = np.zeros(num_points)
-        # self.pY = np.zeros(num_points)
-        # self.pXY = np.zeros((num_points, num_points))
+        # Initialise arrays
+        self.X = np.zeros(num_points)
+        self.Y = np.zeros(num_points)
+        self.XY = np.zeros((num_points, num_points))
+        self.pX = np.zeros(num_points)
+        self.pY = np.zeros(num_points)
+        self.pXY = np.zeros((num_points, num_points))
         
-        # # Write x and y values into the first columns of pX and pY respectively.
-        # self.X = np.linspace(x_range[0], x_range[1], num_points)
-        # self.Y = np.linspace(y_range[0], y_range[1], num_points)
-        # self.XY = np.meshgrid(self.X, self.Y)
+        # Write x and y values into the first columns of pX and pY respectively.
+        self.X = np.linspace(x_range[0], x_range[1], num_points)
+        self.Y = np.linspace(y_range[0], y_range[1], num_points)
 
-        # # Distances between points. Useful for normalisation later.
-        # dx = self.X[1] - self.X[0]
-        # dy = self.Y[1] - self.Y[0]
+        # Distances between points. Useful for normalisation later.
+        dx = self.X[1] - self.X[0]
+        dy = self.Y[1] - self.Y[0]
 
-        # # Carry out the following integration: p(X, Y) &= \int \! d\alpha_\text{re} \int \! d\beta_\text{re} Q_{\text{PS}}(\alpha, \beta).
-        # # Remember that \alpha and \beta are complex.
-        # for i, x in enumerate(self.X):
-        #     for j, y in enumerate(self.Y):
-        #         # Need to integrate over the real parts of alpha and beta, for this value of x and y.
-        #         self.pXY[i, j] = nquad(self.Q_PS_lambda, )
+        # Evaluate self.pXY via nquad. This is computationally expensive, but luckily pX and pY can be evaluated from pXY by using trapz across slices of pXY. This is true if the density of points is high enough.
+        start_time = time.time()
+        for i in prange(num_points):
+            for j in prange(num_points):
+                integrand = lambda alpha_re, beta_re : self.Q_PS_lambda(alpha_re, self.X[i], beta_re, self.Y[j])
+                self.pXY[i][j] = nquad(integrand, [[-np.inf, np.inf], [-np.inf, np.inf]])[0]
+        end_time = time.time()
+        pXY_execution_time = end_time - start_time
+
+        # Evaluate pX and pY is a similar manner (that is, using nquad).
+        # There is a lot of repeated compute here, so consider switching to trapz if this is too slow.
+        start_time = time.time()
+        for i in prange(num_points):
+            integrand = lambda alpha_im, beta_re, beta_im : self.Q_PS_lambda(self.X[i], alpha_im, beta_re, beta_im)
+            self.pX[i] = nquad(integrand, [[-np.inf, np.inf], [-np.inf, np.inf], [-np.inf, np.inf]])[0]
+        end_time = time.time()
+        pX_execution_time = end_time - start_time
+
+        start_time = time.time()
+        for i in prange(num_points):
+            integrand = lambda alpha_re, alpha_im, beta_im : self.Q_PS_lambda(alpha_re, alpha_im, self.Y[i], beta_im)
+            self.pY[i] = nquad(integrand, [[-np.inf, np.inf], [-np.inf, np.inf], [-np.inf, np.inf]])[0]
+        end_time = time.time()
+        pY_execution_time = end_time - start_time
+
+        return self.pXY, self.pX, self.pY, pXY_execution_time, pX_execution_time, pY_execution_time
 
     def _define_filter_function(self, m):
         """
