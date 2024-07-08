@@ -230,10 +230,7 @@ class GBSR_quantum_statistics():
         """
             Evaluate Q_PS subject to post-selection on a grid of points \mathbb{R}^4, which bears equivalence to \mathbb{C}^2 which Q is actually defined on.
         """
-        start_time = time.time()
         self.Q_values = self.Q_PS_lambda(self.alpha_re_mesh, self.alpha_im_mesh, self.beta_re_mesh, self.beta_im_mesh)
-        end_time = time.time()
-        print("Time taken to evaluate Q_PS_lambda on grid:", end_time - start_time, "seconds")
         return self.Q_values
 
     def _evaluate_marginals(self):
