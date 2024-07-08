@@ -236,39 +236,20 @@ class GBSR_quantum_statistics():
         print("Time taken to evaluate Q_PS_lambda on grid:", end_time - start_time, "seconds")
         return self.Q_values
 
-    def _evaluate_pxy(self):
+    def _evaluate_marginals(self):
         """
-            By numerically integrating out alpha_im and beta_im (using np.trapz), evaluate the joint probability distribution p(X = x, Y = y).
-            Integrate out beta_im, which corresponds to axis = 3, then integrate out alpha_im, which corresponds to axis = 1.
+            Evaluate the marginal probability distributions p(X = x), p(Y = y) and p(X = x, Y = y) using the joint probability distribution p(alpha_re, alpha_im, beta_re, beta_im).
         """
-        start_time = time.time()
+        # Integrate out alpha_im and beta_im which correspond to axis = 3 and axis = 1 respectively.
         self.pxy = np.trapz(np.trapz(self.Q_values, self.axis_range, axis = 3), self.axis_range, axis = 1)
-        end_time = time.time()
-        print("Time taken to evaluate pxy:", end_time - start_time, "seconds")
-        return self.pxy
-    
-    def _evaluate_px(self):
-        """
-            Given the joint probability distribution p(X = x, Y = y), evaluate the marginal probability distribution p(X = x) by integrating out y.
-            This corresponds to integrating out beta_re from the function p(alpha_re, beta_re) = p(X = x, Y = y).
-        """
-        start_time = time.time()
-        self.px = np.trapz(self.pxy, self.axis_range, axis = 1)
-        end_time = time.time()
-        print("Time taken to evaluate px:", end_time - start_time, "seconds")
-        return self.px
-    
-    def _evaluate_py(self):
-        """
-            Given the joint probability distribution p(X = x, Y = y), evaluate the marginal probability distribution p(Y = y) by integrating out x.
-            This corresponds to integrating out alpha_re from the function p(alpha_re, beta_re) = p(X = x, Y = y).
-        """
-        start_time = time.time()
-        self.py = np.trapz(self.pxy, self.axis_range, axis = 0)
-        end_time = time.time()
-        print("Time taken to evaluate py:", end_time - start_time, "seconds")
-        return self.py
 
+        # Integrate out beta_re, which is axis = 1 for pxy.
+        self.px = np.trapz(self.pxy, self.axis_range, axis = 1)
+
+        # Integrate out alpha_re, which is axis = 0 for pxy.
+        self.py = np.trapz(self.pxy, self.axis_range, axis = 0)
+
+        return self.px, self.py, self.pxy
 
 class GBSR(GBSR_quantum_statistics):
     def __init__(self, m) -> None:
