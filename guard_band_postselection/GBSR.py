@@ -1,11 +1,11 @@
 import numpy as np
 import sympy as sp
-from numba import njit, prange
+from numba import njit, vectorize, float64
 from scipy.integrate import nquad
 import time
 
 class GBSR_quantum_statistics():
-    def __init__(self, modulation_variance, transmittance, excess_noise, NJIT = True) -> None:
+    def __init__(self, modulation_variance, transmittance, excess_noise, grid_range = [-5, 5], num_points_on_axis = 64, JIT = True) -> None:
         """
         Class arguments:
             modulation_variance: Alice's modulation variance $V_\\text{mod}$.
@@ -17,7 +17,7 @@ class GBSR_quantum_statistics():
         self.transmittance = transmittance
         self.excess_noise = excess_noise
 
-        self.NJIT = NJIT
+        self.JIT = JIT
 
         self.alice_variance = modulation_variance + 1.0                              # Alice's effective variance $V_A = $V_\\text{mod} + 1$ in SNU.
         self.bob_variance = (transmittance * modulation_variance) + 1 + excess_noise # Bob's effective variance $V_B = T V_\\text{mod} + 1 + \\xi$ in SNU.
@@ -50,13 +50,18 @@ class GBSR_quantum_statistics():
             np.sqrt(self.transmittance * (self.alice_variance*self.alice_variance - 1))
         )
 
+        # Generate the grid over which to perform necessary numerical integrations.
+        self.axis_range = np.linspace(grid_range[0], grid_range[1], num_points_on_axis)
+        self.alpha_re_mesh, self.alpha_im_mesh, self.beta_re_mesh, self.beta_im_mesh = np.meshgrid(self.axis_range, self.axis_range, self.axis_range, self.axis_range)
+
         # Placeholder attributes for those that need to be evaluated with the specifics of the guard bands in mind.
         self.F_sym = None       # Symbolic representation of the filter function $F(\beta)$.
         self.p_pass = None      # Numerical value of the probability of passing the filter function.
         self.Q_PS_lambda = None # Lambda function for the Q function subject to post-selection.
-        self.pX = None          # Array containing marginal probability distribution values p(X = x).
-        self.pY = None          # Array containing marginal probability distribution values p(Y = y).
-        self.pXY = None         # 2D array containing joint probability distribution values p(X = x, Y = y).    
+        self.Q_values = None    # Array of values of the Q function subject to post-selection on a grid of points.
+        self.px = None          # Array containing marginal probability distribution values p(X = x).
+        self.py = None          # Array containing marginal probability distribution values p(Y = y).
+        self.pxy = None         # 2D array containing joint probability distribution values p(X = x, Y = y).    
 
     def _evaluate_p_pass(self, tau_arr, g_arr):
         """
@@ -78,7 +83,7 @@ class GBSR_quantum_statistics():
             "numpy"
         )
 
-        if self.NJIT:
+        if self.JIT:
             integrand = njit(integrand)
 
         # Integrate integrand over the entire complex plane.
@@ -103,74 +108,6 @@ class GBSR_quantum_statistics():
             [(sp.Symbol(f'g_plus:{i}'), g_arr[i, 1]) for i in range(len(g_arr))] +
             [(sp.Symbol(f'taus:{i}'), tau_arr[i]) for i in range(len(tau_arr))]
         )
-
-    def _evaluate_marginals(self, x_range, y_range, num_points):
-        """
-            Wrapper function for _evaluate_marginals_uncompiled. This function is JIT compiled if the NJIT flag is set to True.
-        """
-        if self.NJIT:
-            return njit(self._evaluate_marginals_uncompiled, parallel = True)(x_range, y_range, num_points)
-        
-        return self._evaluate_marginals_uncompiled(x_range, y_range, num_points)
-    
-    def _evaluate_marginals_uncompiled(self, x_range, y_range, num_points):
-        """
-        Given the form of Q_PS (in a numerically integrable lambda function), evaluate the marginal probability distributions p(X = x), p(Y = y) and the joint probability distribution p(X = x, Y = y).
-        
-        Arguments:
-            x_range: array(float)
-                The range of values for X.
-            y_range: array(float)
-                The range of values for Y.
-            num_points: integer
-                The number of points to evaluate the probability distributions at.
-                For the joint probability distribution, this will be num_points^2, so be careful with large values.
-        """
-        if self.Q_PS_lambda is None:
-            raise ValueError("The Q_PS lambda function has not been generated yet.")
-        
-        # Initialise arrays
-        self.X = np.zeros(num_points)
-        self.Y = np.zeros(num_points)
-        self.XY = np.zeros((num_points, num_points))
-        self.pX = np.zeros(num_points)
-        self.pY = np.zeros(num_points)
-        self.pXY = np.zeros((num_points, num_points))
-        
-        # Write x and y values into the first columns of pX and pY respectively.
-        self.X = np.linspace(x_range[0], x_range[1], num_points)
-        self.Y = np.linspace(y_range[0], y_range[1], num_points)
-
-        # Distances between points. Useful for normalisation later.
-        dx = self.X[1] - self.X[0]
-        dy = self.Y[1] - self.Y[0]
-
-        # Evaluate self.pXY via nquad. This is computationally expensive, but luckily pX and pY can be evaluated from pXY by using trapz across slices of pXY. This is true if the density of points is high enough.
-        start_time = time.time()
-        for i in prange(num_points):
-            for j in prange(num_points):
-                integrand = lambda alpha_re, beta_re : self.Q_PS_lambda(alpha_re, self.X[i], beta_re, self.Y[j])
-                self.pXY[i][j] = nquad(integrand, [[-np.inf, np.inf], [-np.inf, np.inf]])[0]
-        end_time = time.time()
-        pXY_execution_time = end_time - start_time
-
-        # Evaluate pX and pY is a similar manner (that is, using nquad).
-        # There is a lot of repeated compute here, so consider switching to trapz if this is too slow.
-        start_time = time.time()
-        for i in prange(num_points):
-            integrand = lambda alpha_im, beta_re, beta_im : self.Q_PS_lambda(self.X[i], alpha_im, beta_re, beta_im)
-            self.pX[i] = nquad(integrand, [[-np.inf, np.inf], [-np.inf, np.inf], [-np.inf, np.inf]])[0]
-        end_time = time.time()
-        pX_execution_time = end_time - start_time
-
-        start_time = time.time()
-        for i in prange(num_points):
-            integrand = lambda alpha_re, alpha_im, beta_im : self.Q_PS_lambda(alpha_re, alpha_im, self.Y[i], beta_im)
-            self.pY[i] = nquad(integrand, [[-np.inf, np.inf], [-np.inf, np.inf], [-np.inf, np.inf]])[0]
-        end_time = time.time()
-        pY_execution_time = end_time - start_time
-
-        return self.pXY, self.pX, self.pY, pXY_execution_time, pX_execution_time, pY_execution_time
 
     def _define_filter_function(self, m):
         """
@@ -237,8 +174,8 @@ class GBSR_quantum_statistics():
             ).simplify(),
         )
 
-        if self.NJIT:
-            self.Q_star_lambda = njit(self.Q_star_lambda)
+        if self.JIT:
+            self.Q_star_lambda = vectorize([float64(float64, float64, float64, float64)], target = "parallel")(self.Q_star_lambda)
 
         return self.Q_star_lambda
 
@@ -284,10 +221,54 @@ class GBSR_quantum_statistics():
             "numpy"
         )
 
-        if self.NJIT:
-            self.Q_PS_lambda = njit(self.Q_PS_lambda)
+        if self.JIT:
+            self.Q_PS_lambda = vectorize([float64(float64, float64, float64, float64)], target = "parallel")(self.Q_PS_lambda)
 
         return self.Q_PS_lambda
+
+    def _evaluate_Q_PS_lambda_on_grid(self):
+        """
+            Evaluate Q_PS subject to post-selection on a grid of points \mathbb{R}^4, which bears equivalence to \mathbb{C}^2 which Q is actually defined on.
+        """
+        start_time = time.time()
+        self.Q_values = self.Q_PS_lambda(self.alpha_re_mesh, self.alpha_im_mesh, self.beta_re_mesh, self.beta_im_mesh)
+        end_time = time.time()
+        print("Time taken to evaluate Q_PS_lambda on grid:", end_time - start_time, "seconds")
+        return self.Q_values
+
+    def _evaluate_pxy(self):
+        """
+            By numerically integrating out alpha_im and beta_im (using np.trapz), evaluate the joint probability distribution p(X = x, Y = y).
+            Integrate out beta_im, which corresponds to axis = 3, then integrate out alpha_im, which corresponds to axis = 1.
+        """
+        start_time = time.time()
+        self.pxy = np.trapz(np.trapz(self.Q_values, self.axis_range, axis = 3), self.axis_range, axis = 1)
+        end_time = time.time()
+        print("Time taken to evaluate pxy:", end_time - start_time, "seconds")
+        return self.pxy
+    
+    def _evaluate_px(self):
+        """
+            Given the joint probability distribution p(X = x, Y = y), evaluate the marginal probability distribution p(X = x) by integrating out y.
+            This corresponds to integrating out beta_re from the function p(alpha_re, beta_re) = p(X = x, Y = y).
+        """
+        start_time = time.time()
+        self.px = np.trapz(self.pxy, self.axis_range, axis = 1)
+        end_time = time.time()
+        print("Time taken to evaluate px:", end_time - start_time, "seconds")
+        return self.px
+    
+    def _evaluate_py(self):
+        """
+            Given the joint probability distribution p(X = x, Y = y), evaluate the marginal probability distribution p(Y = y) by integrating out x.
+            This corresponds to integrating out alpha_re from the function p(alpha_re, beta_re) = p(X = x, Y = y).
+        """
+        start_time = time.time()
+        self.py = np.trapz(self.pxy, self.axis_range, axis = 0)
+        end_time = time.time()
+        print("Time taken to evaluate py:", end_time - start_time, "seconds")
+        return self.py
+
 
 class GBSR(GBSR_quantum_statistics):
     def __init__(self, m) -> None:
