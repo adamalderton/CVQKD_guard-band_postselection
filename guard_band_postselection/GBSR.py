@@ -11,7 +11,7 @@ class GBSR_quantum_statistics():
             transmittance,
             excess_noise,
             grid_range = [-5, 5],
-            num_points_on_axis = 64,
+            num_points_on_axis = 128,
             JIT = True
         ) -> None:
         """
@@ -63,53 +63,52 @@ class GBSR_quantum_statistics():
         self.axis_range = np.linspace(grid_range[0], grid_range[1], num_points_on_axis)
         self.alpha_re_mesh, self.alpha_im_mesh, self.beta_re_mesh, self.beta_im_mesh = np.meshgrid(self.axis_range, self.axis_range, self.axis_range, self.axis_range)
 
-        # Placeholder attributes for those that need to be evaluated with the specifics of the guard bands in mind.
-        self.F_sym = None       # Symbolic representation of the filter function $F(\beta)$.
-        self.p_pass = None      # Numerical value of the probability of passing the filter function.
-        self.Q_PS_lambda = None # Lambda function for the Q function subject to post-selection.
-        self.Q_values = None    # Array of values of the Q function subject to post-selection on a grid of points.
-        self.px = None          # Array containing marginal probability distribution values p(X = x).
-        self.py = None          # Array containing marginal probability distribution values p(Y = y).
-        self.pxy = None         # 2D array containing joint probability distribution values p(X = x, Y = y).    
+        # Generate Q_star_values. These are constant for now and do not need to be updated (for constant a, b and c)
+        self.Q_star_values = self.Q_star_lambda(self.alpha_re_mesh, self.alpha_im_mesh, self.beta_re_mesh, self.beta_im_mesh)
 
-    def _evaluate_p_pass(self, tau_arr, g_arr):
+        # Placeholder attributes for those that need to be evaluated with the specifics of the guard bands in mind.
+        self.F_sym = None           # Symbolic representation of the filter function $F(\beta)$.
+        self.p_pass = None          # Numerical value of the probability of passing the filter function.
+        self.Q_PS_values = None     # Array of values of the Q function AFTER post-selection on a grid of points.
+        self.px = None              # Array containing marginal probability distribution values p(X = x).
+        self.py = None              # Array containing marginal probability distribution values p(Y = y).
+        self.pxy = None             # 2D array containing joint probability distribution values p(X = x, Y = y).    
+
+    def _evaluate_p_pass_and_Q_PS_values(self, tau_arr, g_arr):
         """
-        Evaluate the probability of passing the filter function.
+        Evaluate the probability of passing the filter function by integrating over (F(\beta) \times Q*(\alpha, \beta)) over the entire complex plane.
 
         Arguments:
-            F_sym: sympy expression
-                The filter function $F(\beta)$.
             tau_arr: array(float)
                 An array holding the values of $\tau_i$.
             g_arr: array(float)
                 An array holding the values of $g_{\pm, i}$. g[i][0] contains $g_{i,-}$ and g[i][1] contains $g_{i,+}$.
         """
-        F = self._substitute_guard_band_properties_into_F(tau_arr, g_arr)
+        F_lambda = self._generate_F_lambda(tau_arr, g_arr)
 
-        # Substitute and lambdify the integrand which F(\beta) Q*(\alpha, \beta).
-        integrand = sp.lambdify(
-            (self.alpha_re_sym, self.alpha_im_sym, self.beta_re_sym, self.beta_im_sym),
-            ((F * self.Q_star_sym).simplify()).subs(
-                [
-                    (self.alpha_sym, self.alpha_re_sym + self.alpha_im_sym*1j), # alpha = alpha_re + i alpha_im
-                    (self.beta_sym, self.beta_re_sym + self.beta_im_sym*1j),    # beta = beta_re + i beta_im
-                    (self.a_sym, self.a),
-                    (self.b_sym, self.b),
-                    (self.c_sym, self.c)]
-            ).simplify(),
-            "numpy"
+        # Find F * Q_star, in numerical form.
+        # We store the intermediate (unnormalised) Q_PS_values for later use in self.QS_PS_values for now.
+        # These values will shortly be normalised by division by p_pass.
+        self.Q_PS_values = F_lambda(self.beta_re_mesh, self.beta_im_mesh) * self.Q_star_values
+
+        # Intergrate over the entire complex plane (using a 4D trapz) to find p_pass
+        self.p_pass = \
+        np.trapz(
+            np.trapz(
+                np.trapz(
+                    np.trapz(
+                        self.Q_PS_values, self.axis_range, axis = 3
+                    ), self.axis_range, axis = 2
+                ), self.axis_range, axis = 1
+            ), self.axis_range, axis = 0
         )
 
-        if self.JIT:
-            integrand = vectorize([float64(float64, float64, float64, float64)], target = "parallel")(integrand)
+        # Divide through by p_pass to find normalise Q_PS_values
+        self.Q_PS_values /= self.p_pass
 
-        # Integrate integrand over the entire complex plane.
-        # Use nquad here as precision is actually important in this case as it yields a normalisation term.
-        self.p_pass = nquad(integrand, [[-np.inf, np.inf], [-np.inf, np.inf], [-np.inf, np.inf], [-np.inf, np.inf]])[0]
+        return self.p_pass, self.Q_PS_values
 
-        return self.p_pass
-
-    def _substitute_guard_band_properties_into_F(self, tau_arr, g_arr):
+    def _generate_F_lambda(self, tau_arr, g_arr):
         """
         Substitute the guard band properties into the filter function $F(\beta)$.
 
@@ -121,10 +120,15 @@ class GBSR_quantum_statistics():
             g_arr: array(float)
                 An array holding the values of $g_{\pm, i}$. g[i][0] contains $g_{i,-}$ and g[i][1] contains $g_{i,+}$.
         """
-        return self.F_sym.subs(
-            [(sp.Symbol(f'g_minus{i}'), g_arr[i][0]) for i in range(len(g_arr))] +
-            [(sp.Symbol(f'g_plus{i}'), g_arr[i][1]) for i in range(len(g_arr))] +
-            [(sp.Symbol(f'taus{i}'), tau_arr[i]) for i in range(len(tau_arr))]
+        return sp.lambdify(
+            (self.beta_re_sym, self.beta_im_sym),
+            self.F_sym.subs(
+                [(sp.Symbol(f'g_minus{i}'), g_arr[i][0]) for i in range(len(g_arr))] +
+                [(sp.Symbol(f'g_plus{i}'), g_arr[i][1]) for i in range(len(g_arr))] +
+                [(sp.Symbol(f'taus{i}'), tau_arr[i]) for i in range(len(tau_arr))] +
+                [(self.beta_sym, self.beta_re_sym + self.beta_im_sym*1j)]
+            ),
+            "numpy"
         )
 
     def _define_filter_function(self, m):
@@ -157,12 +161,10 @@ class GBSR_quantum_statistics():
             conditions.append(sp.And((-1 * g_minus[i]) <= (sp.im(self.beta_sym) - taus[i]), (sp.im(self.beta_sym) - taus[i]) <= g_plus[i]))
         
         # Define the filter function. This unpacks conditions into essentially a huge OR statement.
-        F = sp.Piecewise(
+        self.F_sym = sp.Piecewise(
             (0, sp.Or(*conditions)),
             (1, True)
         )
-
-        self.F_sym = F
 
         return self.F_sym
 
@@ -197,66 +199,12 @@ class GBSR_quantum_statistics():
 
         return self.Q_star_lambda
 
-    def _generate_Q_PS_lambda(self, tau_arr, g_arr):
-        """
-        Generate the Q function (subject to post-selection, hence Q_PS) for a given covariance matrix in a lambda function, that is JIT compiled.
-        IMPORTANT: Due to needing real integrands for scipy.integrate.nquad, the Q function is evaluated with the real and imaginary parts of alpha and beta as separate arguments.
-        That is, Q_PS_lambda(alpha_re, alpha_im, beta_re, beta_im).
-
-        Arguments:
-            a: float
-                The coefficient $a$ of the covariance matrix.
-            b: float
-                The coefficient $b$ of the covariance matrix.
-            c: float
-                The coefficient $c$ of the covariance matrix.
-            tau_arr: array(float)
-                An array holding the values of $\tau_i$.
-            g_arr: array(float)
-                An array holding the values of $g_{\pm, i}$. g[i, 0] contains $g_{i,-}$ and g[i, 1] contains $g_{i,+}$.
-        """
-        
-        # First, substitute the numerical guard band properties into the filter function.
-        F = self._substitute_guard_band_properties_into_F(tau_arr, g_arr)
-
-        # Find p_pass
-        p_pass = self._evaluate_p_pass(tau_arr, g_arr)
-
-        # Therefore, the composite Q function in symbolic form
-        Q_PS = F * self.Q_star_sym / p_pass
-
-        # Substitute and lambdify
-        self.Q_PS_lambda = sp.lambdify(
-            (self.alpha_re_sym, self.alpha_im_sym, self.beta_re_sym, self.beta_im_sym),                                                                      
-            Q_PS.subs(
-                [
-                    (self.alpha_sym, self.alpha_re_sym + self.alpha_im_sym*1j), # alpha = alpha_re + i alpha_im
-                    (self.beta_sym, self.beta_re_sym + self.beta_im_sym*1j),    # beta = beta_re + i beta_im
-                    (self.a_sym, self.a),
-                    (self.b_sym, self.b),
-                    (self.c_sym, self.c)]
-            ).simplify(),
-            "numpy"
-        )
-
-        if self.JIT:
-            self.Q_PS_lambda = vectorize([float64(float64, float64, float64, float64)], target = "parallel")(self.Q_PS_lambda)
-
-        return self.Q_PS_lambda
-
-    def _evaluate_Q_PS_lambda_on_grid(self):
-        """
-            Evaluate Q_PS subject to post-selection on a grid of points \mathbb{R}^4, which bears equivalence to \mathbb{C}^2 which Q is actually defined on.
-        """
-        self.Q_values = self.Q_PS_lambda(self.alpha_re_mesh, self.alpha_im_mesh, self.beta_re_mesh, self.beta_im_mesh)
-        return self.Q_values
-
-    def _evaluate_marginals(self):
+    def _evaluate_Q_PS_marginals(self):
         """
             Evaluate the marginal probability distributions p(X = x), p(Y = y) and p(X = x, Y = y) using the joint probability distribution p(alpha_re, alpha_im, beta_re, beta_im).
         """
         # Integrate out alpha_im and beta_im which correspond to axis = 3 and axis = 1 respectively.
-        self.pxy = np.trapz(np.trapz(self.Q_values, self.axis_range, axis = 3), self.axis_range, axis = 1)
+        self.pxy = np.trapz(np.trapz(self.Q_PS_values, self.axis_range, axis = 3), self.axis_range, axis = 1)
 
         # Integrate out beta_re, which is axis = 1 for pxy.
         self.px = np.trapz(self.pxy, self.axis_range, axis = 1)
@@ -274,7 +222,7 @@ class GBSR(GBSR_quantum_statistics):
             transmittance,
             excess_noise
         ) -> None:
-        super().__init__(modulation_variance, transmittance, excess_noise, JIT = False)
+        super().__init__(modulation_variance, transmittance, excess_noise)
 
         self.m = m
 
@@ -286,8 +234,11 @@ class GBSR(GBSR_quantum_statistics):
         self.tau_arr = np.array([-np.inf, 0.0, np.inf])
         self.g_arr = np.array([[0.0, 0.0], [0.5, 0.5], [0.0, 0.0]])
 
-        # Find p_pass explicitly here for now, although it is found within _generate_Q_star_lambda later.
-        # self.p_pass = self._evaluate_p_pass(self.tau_arr, self.g_arr)
+        # Evaluate the probability of passing the filter function and the Q function after post-selection.
+        self.p_pass, self.Q_PS_values = self._evaluate_p_pass_and_Q_PS_values(self.tau_arr, self.g_arr)
+
+        # Evaluate marginals for now.
+        self.px, self.py, self.pxy = self._evaluate_Q_PS_marginals()
         
     def evaluate_key_rate_in_bits_per_pulse(self, m, tau_arr, g_arr):
         """
@@ -348,12 +299,8 @@ class GBSR(GBSR_quantum_statistics):
     
 if __name__ == "__main__":
     import time
-
-    gbsr = GBSR(1, 1.0, 1.0, 0.0)
-
     start_time = time.time()
-    gbsr._evaluate_p_pass(gbsr.tau_arr, gbsr.g_arr)
+    gbsr = GBSR(1, 1.0, 1.0, 0.0)
     end_time = time.time()
-
     execution_time = end_time - start_time
-    print(f"Execution time: {execution_time} seconds")
+    print(f"GBSR initialization took {execution_time} seconds.")
