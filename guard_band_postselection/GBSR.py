@@ -11,7 +11,7 @@ class GBSR_quantum_statistics():
             transmittance,
             excess_noise,
             grid_range = [-5, 5],
-            num_points_on_axis = 128,
+            num_points_on_axis = 64,
             JIT = True
         ) -> None:
         """
@@ -72,7 +72,10 @@ class GBSR_quantum_statistics():
         self.Q_PS_values = None     # Array of values of the Q function AFTER post-selection on a grid of points.
         self.px = None              # Array containing marginal probability distribution values p(X = x).
         self.py = None              # Array containing marginal probability distribution values p(Y = y).
-        self.pxy = None             # 2D array containing joint probability distribution values p(X = x, Y = y).    
+        self.pxy = None             # 2D array containing joint probability distribution values p(X = x, Y = y).
+        self.a_PS = None            # Effective covariance matrix coefficient a_PS.
+        self.b_PS = None            # Effective covariance matrix coefficient b_PS.
+        self.c_PS = None            # Effective covariance matrix coefficient c_PS. 
 
     def _evaluate_p_pass_and_Q_PS_values(self, tau_arr, g_arr):
         """
@@ -92,16 +95,7 @@ class GBSR_quantum_statistics():
         self.Q_PS_values = F_lambda(self.beta_re_mesh, self.beta_im_mesh) * self.Q_star_values
 
         # Intergrate over the entire complex plane (using a 4D trapz) to find p_pass
-        self.p_pass = \
-        np.trapz(
-            np.trapz(
-                np.trapz(
-                    np.trapz(
-                        self.Q_PS_values, self.axis_range, axis = 3
-                    ), self.axis_range, axis = 2
-                ), self.axis_range, axis = 1
-            ), self.axis_range, axis = 0
-        )
+        self.p_pass = self._4D_trapz_over_Q(self.Q_PS_values)
 
         # Divide through by p_pass to find normalise Q_PS_values
         self.Q_PS_values /= self.p_pass
@@ -170,17 +164,9 @@ class GBSR_quantum_statistics():
 
     def _generate_Q_star_lambda(self):
         """
-        Generate the Q function (subject to no post-selection, hence Q_star) for a given covariance matrix in a lambda function, that is JIT compiled.
-        IMPORTANT: Due to needing real integrands for scipy.integrate.nquad, the Q function is evaluated with the real and imaginary parts of alpha and beta as separate arguments.
-        That is, Q_star_lambda(alpha_re, alpha_im, beta_re, beta_im).
-
-        Arguments:
-            a: float
-                The coefficient $a$ of the covariance matrix.
-            b: float
-                The coefficient $b$ of the covariance matrix.
-            c: float
-                The coefficient $c$ of the covariance matrix.
+            Generate the Q function (subject to no post-selection, hence Q_star) for a given covariance matrix in a lambda function, that is JIT compiled.
+            IMPORTANT: Due to needing real integrands for scipy.integrate.nquad, the Q function is evaluated with the real and imaginary parts of alpha and beta as separate arguments.
+            That is, Q_star_lambda(alpha_re, alpha_im, beta_re, beta_im).
         """
         self.Q_star_lambda = sp.lambdify(
             (self.alpha_re_sym, self.alpha_im_sym, self.beta_re_sym, self.beta_im_sym), # Function arguments
@@ -214,6 +200,51 @@ class GBSR_quantum_statistics():
 
         return self.px, self.py, self.pxy
 
+    def _evaluate_a_PS_b_PS_c_PS(self):
+        """
+            Evaluate the effective covariance matrix coefficients for the given post-selected
+            state represented in Q_PS_values.
+
+            a_{\text{PS}} = \int \int d^2\alpha \int \int d^2\beta \left( 4\alpha_\text{re}^2 - 1 \right) Q_{\text{PS}}(\alpha, \beta)
+            b_{\text{PS}} = \int \int d^2\alpha \int \int d^2\beta \left( 4\beta_\text{re}^2 - 1 \right) Q_{\text{PS}}(\alpha, \beta)
+            c_{\text{PS}} = \int \int d^2\alpha \int \int d^2\beta \left( 4\alpha_\text{re}\beta_\text{re} \right) Q_{\text{PS}}(\alpha, \beta)
+        """
+        a_PS_integrand_values = (4.0 * self.alpha_re_mesh**2 - 1.0) * self.Q_PS_values
+        self.a_PS = self._4D_trapz_over_Q(a_PS_integrand_values)
+
+        b_PS_integrand_values = (4.0 * self.beta_re_mesh**2 - 1.0) * self.Q_PS_values
+        self.b_PS = self._4D_trapz_over_Q(b_PS_integrand_values)
+
+        c_PS_integrand_values = (4.0 * self.alpha_re_mesh * self.beta_re_mesh) * self.Q_PS_values
+        self.c_PS = self._4D_trapz_over_Q(c_PS_integrand_values)
+
+        return self.a_PS, self.b_PS, self.c_PS
+
+    def _4D_trapz_over_Q(self, integrand_values):
+        return \
+            np.trapz(
+                np.trapz(
+                    np.trapz(
+                        np.trapz(
+                            integrand_values, self.axis_range, axis = 3
+                        ), self.axis_range, axis = 2
+                    ), self.axis_range, axis = 1
+                ), self.axis_range, axis = 0
+            )
+
+    def _evaluate_effective_covariance_matrix_TEST(self):
+        """
+            For now, brute force all the 4x4 matrix elements of the covariance matrix.
+            Going to do the full 4D integration for now so as to not assume real \equiv im invariance.
+        """
+        self.eff_cov_mat = np.zeros((4, 4))
+
+        mesh_vals = [self.alpha_re_mesh, self.alpha_im_mesh, self.beta_re_mesh, self.beta_im_mesh]
+
+        for i, vals_i in enumerate(mesh_vals):
+            for j, vals_j in enumerate(mesh_vals):
+                self.eff_cov_mat[i][j] = self._4D_trapz_over_Q(vals_i * vals_j * self.Q_PS_values)
+
 class GBSR(GBSR_quantum_statistics):
     def __init__(
             self,
@@ -232,7 +263,7 @@ class GBSR(GBSR_quantum_statistics):
         # Need to evaluate certain functions. (Assuming m = 1 for now).
         # Substitute toy guard band for now.
         self.tau_arr = np.array([-np.inf, 0.0, np.inf])
-        self.g_arr = np.array([[0.0, 0.0], [0.5, 0.5], [0.0, 0.0]])
+        self.g_arr = np.array([[0.0, 0.0], [0.0, 0.0], [0.0, 0.0]])
 
         # Evaluate the probability of passing the filter function and the Q function after post-selection.
         self.p_pass, self.Q_PS_values = self._evaluate_p_pass_and_Q_PS_values(self.tau_arr, self.g_arr)
