@@ -10,7 +10,7 @@ class GBSR_quantum_statistics():
             modulation_variance,
             transmittance,
             excess_noise,
-            grid_range = [-5, 5],
+            grid_range = [-6, 6],
             num_points_on_axis = 64,
             JIT = True
         ) -> None:
@@ -53,7 +53,7 @@ class GBSR_quantum_statistics():
         self.beta_re_sym, self.beta_im_sym = sp.symbols('beta_re beta_im', real = True)
 
         # Define the Husimi-Q function of a TMSV vacuum state, subject to no post-selection, in sympy.
-        self.Q_star_sym = (sp.sqrt(self.cov_mat.det()) / sp.pi**2) * sp.exp(-self.a_sym * (sp.Abs(self.alpha_sym))**2 - self.b_sym * sp.Abs(self.beta_sym)**2 - 2 * self.c_sym * sp.Abs(self.alpha_sym) * sp.Abs(self.beta_sym) * sp.cos(sp.arg(self.alpha_sym) - sp.arg(self.beta_sym)))
+        self.Q_star_sym = (sp.sqrt(self.cov_mat.det()) / sp.pi**2) * sp.exp((-self.a_sym * (sp.Abs(self.alpha_sym))**2) - (self.b_sym * (sp.Abs(self.beta_sym))**2) - (2 * self.c_sym * sp.Abs(self.alpha_sym) * sp.Abs(self.beta_sym) * sp.cos(sp.arg(self.alpha_sym) - sp.arg(self.beta_sym))))
 
         # Generate the Q_star lambda function with, a, b and c as parameters. This must be updated when a, b and c change.
         # This should probably be done as a class property but it's likely just me using this code so this is probably okay.
@@ -204,33 +204,21 @@ class GBSR_quantum_statistics():
         """
             Evaluate the effective covariance matrix coefficients for the given post-selected
             state represented in Q_PS_values.
-
-            a_{\text{PS}} = \int \int d^2\alpha \int \int d^2\beta \left( 4\alpha_\text{re}^2 - 1 \right) Q_{\text{PS}}(\alpha, \beta)
-            b_{\text{PS}} = \int \int d^2\alpha \int \int d^2\beta \left( 4\beta_\text{re}^2 - 1 \right) Q_{\text{PS}}(\alpha, \beta)
-            c_{\text{PS}} = \int \int d^2\alpha \int \int d^2\beta \left( 4\alpha_\text{re}\beta_\text{re} \right) Q_{\text{PS}}(\alpha, \beta)
         """
-        a_PS_integrand_values = (4.0 * self.alpha_re_mesh**2 - 1.0) * self.Q_PS_values
-        self.a_PS = self._4D_trapz_over_Q(a_PS_integrand_values)
-
-        b_PS_integrand_values = (4.0 * self.beta_re_mesh**2 - 1.0) * self.Q_PS_values
-        self.b_PS = self._4D_trapz_over_Q(b_PS_integrand_values)
-
-        c_PS_integrand_values = (4.0 * self.alpha_re_mesh * self.beta_re_mesh) * self.Q_PS_values
-        self.c_PS = self._4D_trapz_over_Q(c_PS_integrand_values)
+        self.a_PS = 2 * np.abs(self._4D_trapz_over_Q(self.alpha_re_mesh**2 * self.Q_PS_values))
+        self.b_PS = 2 * np.abs(self._4D_trapz_over_Q(self.beta_re_mesh**2 * self.Q_PS_values))
+        self.c_PS = 2 * np.abs(self._4D_trapz_over_Q(self.alpha_re_mesh * self.beta_re_mesh * self.Q_PS_values))
 
         return self.a_PS, self.b_PS, self.c_PS
 
     def _4D_trapz_over_Q(self, integrand_values):
-        return \
-            np.trapz(
-                np.trapz(
-                    np.trapz(
-                        np.trapz(
-                            integrand_values, self.axis_range, axis = 3
-                        ), self.axis_range, axis = 2
-                    ), self.axis_range, axis = 1
-                ), self.axis_range, axis = 0
-            )
+        # Perform integration over each axis using np.trapz
+        integral = np.trapz(integrand_values, x = self.axis_range)
+        integral = np.trapz(integral, x = self.axis_range)
+        integral = np.trapz(integral, x = self.axis_range)
+        integral = np.trapz(integral, x = self.axis_range)
+
+        return integral
 
     def _evaluate_effective_covariance_matrix_TEST(self):
         """
@@ -244,6 +232,7 @@ class GBSR_quantum_statistics():
         for i, vals_i in enumerate(mesh_vals):
             for j, vals_j in enumerate(mesh_vals):
                 self.eff_cov_mat[i][j] = self._4D_trapz_over_Q(vals_i * vals_j * self.Q_PS_values)
+        
 
 class GBSR(GBSR_quantum_statistics):
     def __init__(
@@ -329,9 +318,15 @@ class GBSR(GBSR_quantum_statistics):
         return ((x + 1.0) / 2.0) * np.log2((x + 1.0) / 2.0) - ((x - 1.0) / 2.0) * np.log2((x - 1.0) / 2.0)
     
 if __name__ == "__main__":
-    import time
-    start_time = time.time()
-    gbsr = GBSR(1, 1.0, 1.0, 0.0)
-    end_time = time.time()
-    execution_time = end_time - start_time
-    print(f"GBSR initialization took {execution_time} seconds.")
+    from pprint import pprint
+    import numpy as np
+    import sympy as sp
+    import seaborn as sb
+    import matplotlib.pyplot as plt
+
+    gbsr = GBSR(1, 1.0, 0.5, 0.0)
+
+    print(gbsr.a, gbsr.b, gbsr.c)
+
+    # Find the variance of px and py, and print
+    print(gbsr._4D_trapz_over_Q(gbsr.alpha_re_mesh**2 * gbsr.Q_PS_values))
