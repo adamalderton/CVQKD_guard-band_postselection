@@ -2,6 +2,7 @@ import numpy as np
 import sympy as sp
 from numba import njit, vectorize, float64
 from scipy.integrate import nquad
+from scipy.signal import convolve
 import time
 
 class GBSR_quantum_statistics():
@@ -48,23 +49,24 @@ class GBSR_quantum_statistics():
         # Define symbols for Alice and Bob's coherent states.
         self.alpha_sym, self.beta_sym = sp.symbols('alpha beta', complex = True)
         
-        # Define symbols for the real and complex parts of Alice and Bob's coherent states.
-        self.alpha_re_sym, self.alpha_im_sym = sp.symbols('alpha_re alpha_im', real = True)
-        self.beta_re_sym, self.beta_im_sym = sp.symbols('beta_re beta_im', real = True)
+        # Define symbols for the real and complex parts of Alice and Bob's coherent states. These correspond to quadratures q and p.
+        self.q_1_sym, self.p_1_sym, self.q_2_sym, self.p_2_sym = sp.symbols('q_1 p_1 q_2 p_2', real = True)
 
-        # Define the Husimi-Q function of a TMSV vacuum state, subject to no post-selection, in sympy.
-        self.Q_star_sym = (sp.sqrt(self.cov_mat.det()) / sp.pi**2) * sp.exp((-self.a_sym * (sp.Abs(self.alpha_sym))**2) - (self.b_sym * (sp.Abs(self.beta_sym))**2) - (2 * self.c_sym * sp.Abs(self.alpha_sym) * sp.Abs(self.beta_sym) * sp.cos(sp.arg(self.alpha_sym) - sp.arg(self.beta_sym))))
+        # Store vectors in symbolic vector x
+        self.x = sp.Matrix([self.q_1_sym, self.p_1_sym, self.q_2_sym, self.p_2_sym])
 
-        # Generate the Q_star lambda function with, a, b and c as parameters. This must be updated when a, b and c change.
-        # This should probably be done as a class property but it's likely just me using this code so this is probably okay.
-        self.Q_star_lambda = self._generate_Q_star_lambda()
+        # Define the Wigner function of a TMSV vacuum state, subject to no post-selection, in sympy. "Star" implies no post-selection.
+        self.W_star_sym = (1 / (4 * sp.pi**2 * sp.sqrt(sp.det(self.cov_mat)))) * sp.exp(sp.Rational(-1, 2) * (self.x.T * self.cov_mat.inv() * self.x))
+
+        # Generate the Wigner_star lambda function with a, b and c as parameters.
+        self.W_star_lambda = self._generate_W_star_lambda()
 
         # Generate the grid over which to perform necessary numerical integrations.
         self.axis_range = np.linspace(grid_range[0], grid_range[1], num_points_on_axis)
-        self.alpha_re_mesh, self.alpha_im_mesh, self.beta_re_mesh, self.beta_im_mesh = np.meshgrid(self.axis_range, self.axis_range, self.axis_range, self.axis_range)
+        self.q_1_mesh, self.p_1_mesh, self.q_2_mesh, self.p_2_mesh = np.meshgrid(self.axis_range, self.axis_range, self.axis_range, self.axis_range)
 
-        # Generate Q_star_values. These are constant for now and do not need to be updated (for constant a, b and c)
-        self.Q_star_values = self.Q_star_lambda(self.alpha_re_mesh, self.alpha_im_mesh, self.beta_re_mesh, self.beta_im_mesh)
+        # Perform Weierstrass transform to find Husimi-Q function values for given covariance matrix a, b and c.
+        self.Q_star_values = self._generate_Q_star_values()
 
         # Placeholder attributes for those that need to be evaluated with the specifics of the guard bands in mind.
         self.F_sym = None           # Symbolic representation of the filter function $F(\beta)$.
@@ -73,6 +75,7 @@ class GBSR_quantum_statistics():
         self.px = None              # Array containing marginal probability distribution values p(X = x).
         self.py = None              # Array containing marginal probability distribution values p(Y = y).
         self.pxy = None             # 2D array containing joint probability distribution values p(X = x, Y = y).
+        self.eff_cov_mat = None     # Effective covariance matrix for the post-selected state.
         self.a_PS = None            # Effective covariance matrix coefficient a_PS.
         self.b_PS = None            # Effective covariance matrix coefficient b_PS.
         self.c_PS = None            # Effective covariance matrix coefficient c_PS. 
@@ -92,9 +95,9 @@ class GBSR_quantum_statistics():
         # Find F * Q_star, in numerical form.
         # We store the intermediate (unnormalised) Q_PS_values for later use in self.QS_PS_values for now.
         # These values will shortly be normalised by division by p_pass.
-        self.Q_PS_values = F_lambda(self.beta_re_mesh, self.beta_im_mesh) * self.Q_star_values
+        self.Q_PS_values = F_lambda(self.q_2_mesh, self.p_2_mesh) * self.Q_star_values
 
-        # Intergrate over the entire complex plane (using a 4D trapz) to find p_pass
+        # Integrate over the entire complex plane (using a 4D trapz) to find p_pass
         self.p_pass = self._4D_trapz_over_Q(self.Q_PS_values)
 
         # Divide through by p_pass to find normalise Q_PS_values
@@ -115,12 +118,12 @@ class GBSR_quantum_statistics():
                 An array holding the values of $g_{\pm, i}$. g[i][0] contains $g_{i,-}$ and g[i][1] contains $g_{i,+}$.
         """
         return sp.lambdify(
-            (self.beta_re_sym, self.beta_im_sym),
+            (self.q_2_sym, self.p_2_sym),
             self.F_sym.subs(
                 [(sp.Symbol(f'g_minus{i}'), g_arr[i][0]) for i in range(len(g_arr))] +
                 [(sp.Symbol(f'g_plus{i}'), g_arr[i][1]) for i in range(len(g_arr))] +
                 [(sp.Symbol(f'taus{i}'), tau_arr[i]) for i in range(len(tau_arr))] +
-                [(self.beta_sym, self.beta_re_sym + self.beta_im_sym*1j)]
+                [(self.beta_sym, self.q_2_sym + self.p_2_sym*1j)]
             ),
             "numpy"
         )
@@ -162,32 +165,49 @@ class GBSR_quantum_statistics():
 
         return self.F_sym
 
-    def _generate_Q_star_lambda(self):
+    def _generate_W_star_lambda(self):
         """
-            Generate the Q function (subject to no post-selection, hence Q_star) for a given covariance matrix in a lambda function, that is JIT compiled.
-            IMPORTANT: Due to needing real integrands for scipy.integrate.nquad, the Q function is evaluated with the real and imaginary parts of alpha and beta as separate arguments.
-            That is, Q_star_lambda(alpha_re, alpha_im, beta_re, beta_im).
+            Generate the Wigner function for a TMSV state, subject to no post-selection, in a lambda function that is JIT compiled.
+            IMPORTANT: Due to needing real integrands for scipy.integrate.nquad, the Wigner function is evaluated with the real and imaginary parts of alpha and beta as separate arguments.
+            That is, W_star_lambda(alpha_re, alpha_im, beta_re, beta_im).
         """
-        self.Q_star_lambda = sp.lambdify(
-            (self.alpha_re_sym, self.alpha_im_sym, self.beta_re_sym, self.beta_im_sym), # Function arguments
-            self.Q_star_sym.subs(
+        self.W_star_lambda = sp.lambdify(
+            (self.q_1_sym, self.p_1_sym, self.q_2_sym, self.p_2_sym), # Function arguments
+            self.W_star_sym.subs(
                 [
-                    (self.alpha_sym, self.alpha_re_sym + self.alpha_im_sym*1j), # alpha = alpha_re + i alpha_im
-                    (self.beta_sym, self.beta_re_sym + self.beta_im_sym*1j),    # beta = beta_re + i beta_im
+                    (self.alpha_sym, self.q_1_sym + self.p_1_sym*1j), # alpha = q_1 + i*p_1
+                    (self.beta_sym, self.q_2_sym + self.p_2_sym*1j), # beta = q_2 + i*p_2
                     (self.a_sym, self.a),
                     (self.b_sym, self.b),
-                    (self.c_sym, self.c)]
+                    (self.c_sym, self.c)
+                ]
             ).simplify(),
         )
 
         if self.JIT:
-            self.Q_star_lambda = vectorize([float64(float64, float64, float64, float64)], target = "parallel")(self.Q_star_lambda)
+            self.W_star_lambda = vectorize([float64(float64, float64, float64, float64)], target = "parallel")(self.W_star_lambda)
+        
+        return self.W_star_lambda
+    
+    def _generate_Q_star_values(self):
+        """
+            Generate Wigner function values across the meshgrid, then perform the Weierstrass transform to find the Husimi-Q function values for the given covariance matrix a, b and c.
+        """
 
-        return self.Q_star_lambda
+        # Evaluate the Wigner function values across the meshgrid. Using np.squeeze to remove singleton dimensions.
+        W_star_values = np.squeeze(self.W_star_lambda(self.q_1_mesh, self.p_1_mesh, self.q_2_mesh, self.p_2_mesh))
+
+        # Evaluate the Gaussian kernel values across the meshgrid.
+        kernel_values = (1 / np.pi) * np.exp(-1.0 * (self.q_1_mesh**2 + self.p_1_mesh**2 + self.q_2_mesh**2 + self.p_2_mesh**2))
+
+        # Perform the appropriate FFTs to find the Husimi-Q function values
+        self.Q_star_values = convolve(W_star_values, kernel_values)
+
+        return self.Q_star_values
 
     def _evaluate_Q_PS_marginals(self):
         """
-            Evaluate the marginal probability distributions p(X = x), p(Y = y) and p(X = x, Y = y) using the joint probability distribution p(alpha_re, alpha_im, beta_re, beta_im).
+            Evaluate the marginal probability distributions p(X = x), p(Y = y) and p(X = x, Y = y) using the joint probability distribution p(p_1, q_1, p_2, q_2).
         """
         # Integrate out alpha_im and beta_im which correspond to axis = 3 and axis = 1 respectively.
         self.pxy = np.trapz(np.trapz(self.Q_PS_values, self.axis_range, axis = 3), self.axis_range, axis = 1)
@@ -205,9 +225,13 @@ class GBSR_quantum_statistics():
             Evaluate the effective covariance matrix coefficients for the given post-selected
             state represented in Q_PS_values.
         """
-        self.a_PS = 2 * np.abs(self._4D_trapz_over_Q(self.alpha_re_mesh**2 * self.Q_PS_values))
-        self.b_PS = 2 * np.abs(self._4D_trapz_over_Q(self.beta_re_mesh**2 * self.Q_PS_values))
-        self.c_PS = 2 * np.abs(self._4D_trapz_over_Q(self.alpha_re_mesh * self.beta_re_mesh * self.Q_PS_values))
+        if self.eff_cov_mat is None:
+            self._evaluate_effective_covariance_matrix()
+        
+        # Read out a_PS, b_PS and c_PS from the appropriate elements of effective covariance matrix.
+        self.a_PS = self.eff_cov_mat[0][0]
+        self.b_PS = self.eff_cov_mat[2][2]
+        self.c_PS = self.eff_cov_mat[0][2]
 
         return self.a_PS, self.b_PS, self.c_PS
 
@@ -220,14 +244,14 @@ class GBSR_quantum_statistics():
 
         return integral
 
-    def _evaluate_effective_covariance_matrix_TEST(self):
+    def _evaluate_effective_covariance_matrix(self):
         """
             For now, brute force all the 4x4 matrix elements of the covariance matrix.
             Going to do the full 4D integration for now so as to not assume real \equiv im invariance.
         """
         self.eff_cov_mat = np.zeros((4, 4))
 
-        mesh_vals = [self.alpha_re_mesh, self.alpha_im_mesh, self.beta_re_mesh, self.beta_im_mesh]
+        mesh_vals = [self.q_1_mesh, self.p_1_mesh, self.q_2_mesh, self.p_2_mesh]
 
         for i, vals_i in enumerate(mesh_vals):
             for j, vals_j in enumerate(mesh_vals):
@@ -240,9 +264,10 @@ class GBSR(GBSR_quantum_statistics):
             m,
             modulation_variance,
             transmittance,
-            excess_noise
+            excess_noise,
+            JIT = True
         ) -> None:
-        super().__init__(modulation_variance, transmittance, excess_noise)
+        super().__init__(modulation_variance, transmittance, excess_noise, JIT = JIT)
 
         self.m = m
 
@@ -324,9 +349,4 @@ if __name__ == "__main__":
     import seaborn as sb
     import matplotlib.pyplot as plt
 
-    gbsr = GBSR(1, 1.0, 0.5, 0.0)
-
-    print(gbsr.a, gbsr.b, gbsr.c)
-
-    # Find the variance of px and py, and print
-    print(gbsr._4D_trapz_over_Q(gbsr.alpha_re_mesh**2 * gbsr.Q_PS_values))
+    gbsr = GBSR(1, 1.0, 1.0, 0.0, JIT = False)
