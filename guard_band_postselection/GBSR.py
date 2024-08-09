@@ -1,7 +1,8 @@
 import numpy as np
 import sympy as sp
-from numba import njit, vectorize, float64
+from numba import njit, vectorize, guvectorize, float64
 from scipy.integrate import nquad
+from scipy.optimize import curve_fit
 import time
 
 class GBSR_quantum_statistics():
@@ -37,14 +38,17 @@ class GBSR_quantum_statistics():
 
         # Initialise covariance matrix and its coefficients a, b and c using sympy. Numerical values can be substituted in later.
         self.a_sym, self.b_sym, self.c_sym = sp.symbols('a b c', real = True, positive = True)
-
         self.cov_mat = sp.Matrix([
             [self.a_sym, 0, self.c_sym, 0],
             [0, self.a_sym, 0, -self.c_sym],
             [self.c_sym, 0, self.b_sym, 0],
             [0, -self.c_sym, 0, self.b_sym]
         ])
-    
+
+        # The covariance matrix of the Husimi-Q function associated with the TMSV state. See (Hosseinidehaj 2020) and (Fiurasek and Cerf 2002).
+        # self.gamma_mat = 2 * sp.Inverse(self.cov_mat + sp.eye(4))
+        self.gamma_mat = sp.Inverse(self.cov_mat + sp.eye(4))
+
         # Define symbols for Alice and Bob's coherent states.
         self.alpha_sym, self.beta_sym = sp.symbols('alpha beta', complex = True)
         
@@ -53,15 +57,20 @@ class GBSR_quantum_statistics():
         self.beta_re_sym, self.beta_im_sym = sp.symbols('beta_re beta_im', real = True)
 
         # Define the Husimi-Q function of a TMSV vacuum state, subject to no post-selection, in sympy.
-        self.Q_star_sym = (sp.sqrt(self.cov_mat.det()) / sp.pi**2) * sp.exp((-self.a_sym * (sp.Abs(self.alpha_sym))**2) - (self.b_sym * (sp.Abs(self.beta_sym))**2) - (2 * self.c_sym * sp.Abs(self.alpha_sym) * sp.Abs(self.beta_sym) * sp.cos(sp.arg(self.alpha_sym) - sp.arg(self.beta_sym))))
+        # self.Q_star_sym = (sp.sqrt(self.gamma_mat.det()) / sp.pi**2) * sp.exp((-self.a_sym * (sp.Abs(self.alpha_sym))**2) - (self.b_sym * (sp.Abs(self.beta_sym))**2) - (2 * self.c_sym * sp.Abs(self.alpha_sym) * sp.Abs(self.beta_sym) * sp.cos(sp.arg(self.alpha_sym) - sp.arg(self.beta_sym))))
+        x = sp.Matrix([self.alpha_re_sym, self.alpha_im_sym, self.beta_re_sym, self.beta_im_sym])
+        self.Q_star_sym = (sp.sqrt(self.gamma_mat.det()) / sp.pi**2) * sp.exp(-1 * x.T * self.gamma_mat * x)[0]
 
         # Generate the Q_star lambda function with, a, b and c as parameters. This must be updated when a, b and c change.
         # This should probably be done as a class property but it's likely just me using this code so this is probably okay.
         self.Q_star_lambda = self._generate_Q_star_lambda()
 
+        # Generate the fitting_Q lambda, which takes a 4D vector and a, b and c as parameters.
+        self.Q_fitting_lambda = self._generate_fitting_Q_lambda()
+
         # Generate the grid over which to perform necessary numerical integrations.
         self.axis_range = np.linspace(grid_range[0], grid_range[1], num_points_on_axis)
-        self.alpha_re_mesh, self.alpha_im_mesh, self.beta_re_mesh, self.beta_im_mesh = np.meshgrid(self.axis_range, self.axis_range, self.axis_range, self.axis_range)
+        self.alpha_re_mesh, self.alpha_im_mesh, self.beta_re_mesh, self.beta_im_mesh = np.meshgrid(self.axis_range, self.axis_range, self.axis_range, self.axis_range, indexing = "ij")
 
         # Generate Q_star_values. These are constant for now and do not need to be updated (for constant a, b and c)
         self.Q_star_values = self.Q_star_lambda(self.alpha_re_mesh, self.alpha_im_mesh, self.beta_re_mesh, self.beta_im_mesh)
@@ -73,6 +82,8 @@ class GBSR_quantum_statistics():
         self.px = None              # Array containing marginal probability distribution values p(X = x).
         self.py = None              # Array containing marginal probability distribution values p(Y = y).
         self.pxy = None             # 2D array containing joint probability distribution values p(X = x, Y = y).
+        self.effective_gamma = None # Effective Husimi-Q function covariance matrix for the post-selected state.
+        self.effective_cov_mat = None # Effective covariance matrix for the post-selected state.
         self.a_PS = None            # Effective covariance matrix coefficient a_PS.
         self.b_PS = None            # Effective covariance matrix coefficient b_PS.
         self.c_PS = None            # Effective covariance matrix coefficient c_PS. 
@@ -205,9 +216,22 @@ class GBSR_quantum_statistics():
             Evaluate the effective covariance matrix coefficients for the given post-selected
             state represented in Q_PS_values.
         """
-        self.a_PS = 2 * np.abs(self._4D_trapz_over_Q(self.alpha_re_mesh**2 * self.Q_PS_values))
-        self.b_PS = 2 * np.abs(self._4D_trapz_over_Q(self.beta_re_mesh**2 * self.Q_PS_values))
-        self.c_PS = 2 * np.abs(self._4D_trapz_over_Q(self.alpha_re_mesh * self.beta_re_mesh * self.Q_PS_values))
+        # self.effective_gamma_inv = np.linalg.inv(self._evaluate_effective_gamma())
+
+        # self.effective_cov_mat = self.effective_gamma_inv - np.eye(4)
+
+        # self.a_PS = self.effective_cov_mat[0][0]
+        # self.b_PS = self.effective_cov_mat[2][2]
+        # self.c_PS = self.effective_cov_mat[0][2]
+
+        # return self.a_PS, self.b_PS, self.c_PS
+
+        coords = np.vstack([self.alpha_re_mesh.flatten(), self.alpha_im_mesh.flatten(), self.beta_re_mesh.flatten(), self.beta_im_mesh.flatten()])
+        Q_vals_flat = self.Q_PS_values.ravel()
+
+        popt, pcov = curve_fit(self.Q_fitting_lambda, coords, Q_vals_flat, p0 = [self.a, self.b, self.c], method = "trf") # Method does not require 4D Jacobian (let alone Hessian)
+
+        self.a_PS, self.b_PS, self.c_PS = popt
 
         return self.a_PS, self.b_PS, self.c_PS
 
@@ -220,19 +244,50 @@ class GBSR_quantum_statistics():
 
         return integral
 
-    def _evaluate_effective_covariance_matrix_TEST(self):
+    def _evaluate_effective_gamma(self):
         """
             For now, brute force all the 4x4 matrix elements of the covariance matrix.
             Going to do the full 4D integration for now so as to not assume real \equiv im invariance.
+
+            NOTE: This is redundant and mainly for debugging purposes. You do not need to recreate the entire gamma matrix to read off a_PS, b_PS and c_PS.
         """
-        self.eff_cov_mat = np.zeros((4, 4))
+        self.effective_gamma = np.zeros((4, 4))
 
         mesh_vals = [self.alpha_re_mesh, self.alpha_im_mesh, self.beta_re_mesh, self.beta_im_mesh]
 
         for i, vals_i in enumerate(mesh_vals):
             for j, vals_j in enumerate(mesh_vals):
-                self.eff_cov_mat[i][j] = self._4D_trapz_over_Q(vals_i * vals_j * self.Q_PS_values)
+                self.effective_gamma[i][j] = self._4D_trapz_over_Q(vals_i * vals_j * self.Q_PS_values)
         
+        return self.effective_gamma
+
+    def _generate_fitting_Q_lambda(self):
+        """
+            Generate the fitting_Q lambda, which takes a 4D vector and a, b and c as parameters.
+            Importantly, a, b and c are NOT constant, in constrast to Q_star_lambda etc.
+        """
+
+        Q_fitting = sp.lambdify(
+            (   #function arguments
+                (self.alpha_re_sym, self.alpha_im_sym, self.beta_re_sym, self.beta_im_sym), # coords
+                self.a_sym,
+                self.b_sym,
+                self.c_sym
+            ),
+            self.Q_star_sym.subs(
+                [
+                    (self.alpha_sym, self.alpha_re_sym + self.alpha_im_sym*1j), # alpha = alpha_re + i alpha_im
+                    (self.beta_sym, self.beta_re_sym + self.beta_im_sym*1j),    # beta = beta_re + i beta_im
+                ]
+            ).simplify(),
+        )
+
+        if self.JIT:
+            # Q_fitting = vectorize(["void(float64[:], float64, float64, float64)"], "(n),(),(),()->()", target='parallel')(Q_fitting)
+
+            Q_fitting = njit(Q_fitting)
+        
+        return Q_fitting
 
 class GBSR(GBSR_quantum_statistics):
     def __init__(
@@ -324,9 +379,6 @@ if __name__ == "__main__":
     import seaborn as sb
     import matplotlib.pyplot as plt
 
-    gbsr = GBSR(1, 1.0, 0.5, 0.0)
+    gbsr = GBSR(1, 1.0, 1.0, 0.0)
 
-    print(gbsr.a, gbsr.b, gbsr.c)
-
-    # Find the variance of px and py, and print
-    print(gbsr._4D_trapz_over_Q(gbsr.alpha_re_mesh**2 * gbsr.Q_PS_values))
+    
