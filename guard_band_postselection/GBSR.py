@@ -266,7 +266,6 @@ class GBSR_quantum_statistics():
             Generate the fitting_Q lambda, which takes a 4D vector and a, b and c as parameters.
             Importantly, a, b and c are NOT constant, in constrast to Q_star_lambda etc.
         """
-
         Q_fitting = sp.lambdify(
             (   #function arguments
                 (self.alpha_re_sym, self.alpha_im_sym, self.beta_re_sym, self.beta_im_sym), # coords
@@ -284,7 +283,6 @@ class GBSR_quantum_statistics():
 
         if self.JIT:
             # Q_fitting = vectorize(["void(float64[:], float64, float64, float64)"], "(n),(),(),()->()", target='parallel')(Q_fitting)
-
             Q_fitting = njit(Q_fitting)
         
         return Q_fitting
