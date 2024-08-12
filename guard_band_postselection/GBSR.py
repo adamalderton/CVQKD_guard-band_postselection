@@ -4,6 +4,7 @@ import matplotlib.pyplot as plt
 from numba import njit, vectorize, guvectorize, float64
 from scipy.integrate import nquad
 from scipy.optimize import curve_fit
+from scipy.stats import multivariate_normal
 import time
 
 class GBSR_quantum_statistics():
@@ -12,7 +13,7 @@ class GBSR_quantum_statistics():
             modulation_variance,
             transmittance,
             excess_noise,
-            grid_range = [-6, 6],
+            grid_range = [-10, 10],
             num_points_on_axis = 64,
             JIT = True
         ) -> None:
@@ -55,12 +56,16 @@ class GBSR_quantum_statistics():
 
         # Define the Husimi-Q function of a TMSV vacuum state, subject to no post-selection, in sympy.
         # self.Q_star_sym = (sp.sqrt(self.gamma_mat.det()) / sp.pi**2) * sp.exp((-self.a_sym * (sp.Abs(self.alpha_sym))**2) - (self.b_sym * (sp.Abs(self.beta_sym))**2) - (2 * self.c_sym * sp.Abs(self.alpha_sym) * sp.Abs(self.beta_sym) * sp.cos(sp.arg(self.alpha_sym) - sp.arg(self.beta_sym))))
-        x = sp.Matrix([self.alpha_re_sym, self.alpha_im_sym, self.beta_re_sym, self.beta_im_sym])
+        # x = sp.Matrix([self.alpha_re_sym, self.alpha_im_sym, self.beta_re_sym, self.beta_im_sym])
         # self.Q_star_sym = (sp.sqrt(self.gamma_mat.det()) / sp.pi**2) * sp.exp(-1 * x.T * self.gamma_mat * x)[0]
-        self.Q_star_sym = (1 / (sp.pi**2 * sp.sqrt(sp.det(self.cov_mat_sym + sp.eye(4))))) * sp.exp(-1 * x.T * sp.Inverse(self.cov_mat_sym + sp.eye(4)) * x)[0]
+        # self.Q_star_sym = (1 / (sp.pi**2 * sp.sqrt(sp.det(self.cov_mat_sym + sp.eye(4))))) * sp.exp(-1 * x.T * sp.Inverse(self.cov_mat_sym + sp.eye(4)) * x)[0]
 
         # Generate the Q_star lambda function with, a, b and c as parameters. This must be updated when a, b and c change.
-        self.Q_star_lambda = self._generate_Q_star_lambda()
+        # self.Q_star_lambda = self._generate_Q_star_lambda()
+        self.Q_star_lambda = multivariate_normal(
+            mean = np.zeros(4),
+            cov = self.cov_mat_sym.subs({self.a_sym: self.a, self.b_sym: self.b, self.c_sym: self.c}) + np.eye(4)
+        ).pdf
 
         # Generate the grid over which to perform necessary numerical integrations.
         self.num_points_on_axis = num_points_on_axis
@@ -68,7 +73,8 @@ class GBSR_quantum_statistics():
         self.alpha_re_mesh, self.alpha_im_mesh, self.beta_re_mesh, self.beta_im_mesh = np.meshgrid(self.axis_values, self.axis_values, self.axis_values, self.axis_values, indexing = "ij")
 
         # Generate Q_star_values. These are constant for now and do not need to be updated (for constant a, b and c)
-        self.Q_star_values = self.Q_star_lambda(self.alpha_re_mesh, self.alpha_im_mesh, self.beta_re_mesh, self.beta_im_mesh)
+        #self.Q_star_values = self.Q_star_lambda(self.alpha_re_mesh, self.alpha_im_mesh, self.beta_re_mesh, self.beta_im_mesh)
+        self.Q_star_values = self.Q_star_lambda(np.stack((self.alpha_re_mesh, self.alpha_im_mesh, self.beta_re_mesh, self.beta_im_mesh), axis = -1))
         self.Q_star_values /= np.sum(self.Q_star_values)
 
         # Placeholder attributes for those that need to be evaluated with the specifics of the guard bands in mind.
