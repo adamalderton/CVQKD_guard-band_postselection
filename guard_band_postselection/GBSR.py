@@ -1,5 +1,6 @@
 import numpy as np
 import sympy as sp
+import matplotlib.pyplot as plt
 from numba import njit, vectorize, guvectorize, float64
 from scipy.integrate import nquad
 from scipy.optimize import curve_fit
@@ -87,6 +88,40 @@ class GBSR_quantum_statistics():
         self.a_PS = None            # Effective covariance matrix coefficient a_PS.
         self.b_PS = None            # Effective covariance matrix coefficient b_PS.
         self.c_PS = None            # Effective covariance matrix coefficient c_PS. 
+
+    def plot_marginals(self):
+        """
+            Plot the marginal probability distributions p(X = x), p(Y = y) and p(X = x, Y = y) using the joint probability distribution p(alpha_re, alpha_im, beta_re, beta_im).
+            This is set up to work in iPython environments, such as Jupyter notebooks.
+        """
+
+
+        # Set the figure size
+        fig, axs = plt.subplots(1, 3, figsize=(15, 5))
+
+        # Plot px
+        axs[0].plot(self.axis_range, self.px)
+        axs[0].set_title('Plot of px')
+        axs[0].set_xlabel('x')
+        axs[0].set_ylabel('px')
+
+        # Plot py
+        axs[1].plot(self.axis_range, self.py)
+        axs[1].set_title('Plot of py')
+        axs[1].set_xlabel('x')
+        axs[1].set_ylabel('py')
+
+        # Plot pxy using imshow, with the range set as axis_range \times axis_range
+        axs[2].imshow(self.pxy, extent=(self.axis_range[0], self.axis_range[-1], self.axis_range[0], self.axis_range[-1]), origin='lower')
+        axs[2].set_title('Heatmap of pxy')
+        axs[2].set_xlabel('Index')
+        axs[2].set_ylabel('Index')
+
+        # Adjust the spacing between subplots
+        plt.tight_layout()
+
+        # Show the plot
+        plt.show()
 
     def _evaluate_p_pass_and_Q_PS_values(self, tau_arr, g_arr):
         """
