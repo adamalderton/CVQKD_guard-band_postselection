@@ -39,16 +39,12 @@ class GBSR_quantum_statistics():
 
         # Initialise covariance matrix and its coefficients a, b and c using sympy. Numerical values can be substituted in later.
         self.a_sym, self.b_sym, self.c_sym = sp.symbols('a b c', real = True, positive = True)
-        self.cov_mat = sp.Matrix([
+        self.cov_mat_sym = sp.Matrix([
             [self.a_sym, 0, self.c_sym, 0],
             [0, self.a_sym, 0, -self.c_sym],
             [self.c_sym, 0, self.b_sym, 0],
             [0, -self.c_sym, 0, self.b_sym]
         ])
-
-        # The covariance matrix of the Husimi-Q function associated with the TMSV state. See (Hosseinidehaj 2020) and (Fiurasek and Cerf 2002).
-        # self.gamma_mat = 2 * sp.Inverse(self.cov_mat + sp.eye(4))
-        self.gamma_mat = sp.Inverse(self.cov_mat + sp.eye(4))
 
         # Define symbols for Alice and Bob's coherent states.
         self.alpha_sym, self.beta_sym = sp.symbols('alpha beta', complex = True)
@@ -60,31 +56,30 @@ class GBSR_quantum_statistics():
         # Define the Husimi-Q function of a TMSV vacuum state, subject to no post-selection, in sympy.
         # self.Q_star_sym = (sp.sqrt(self.gamma_mat.det()) / sp.pi**2) * sp.exp((-self.a_sym * (sp.Abs(self.alpha_sym))**2) - (self.b_sym * (sp.Abs(self.beta_sym))**2) - (2 * self.c_sym * sp.Abs(self.alpha_sym) * sp.Abs(self.beta_sym) * sp.cos(sp.arg(self.alpha_sym) - sp.arg(self.beta_sym))))
         x = sp.Matrix([self.alpha_re_sym, self.alpha_im_sym, self.beta_re_sym, self.beta_im_sym])
-        self.Q_star_sym = (sp.sqrt(self.gamma_mat.det()) / sp.pi**2) * sp.exp(-1 * x.T * self.gamma_mat * x)[0]
+        # self.Q_star_sym = (sp.sqrt(self.gamma_mat.det()) / sp.pi**2) * sp.exp(-1 * x.T * self.gamma_mat * x)[0]
+        self.Q_star_sym = (1 / (sp.pi**2 * sp.sqrt(sp.det(self.cov_mat_sym + sp.eye(4))))) * sp.exp(-1 * x.T * sp.Inverse(self.cov_mat_sym + sp.eye(4)) * x)[0]
 
         # Generate the Q_star lambda function with, a, b and c as parameters. This must be updated when a, b and c change.
-        # This should probably be done as a class property but it's likely just me using this code so this is probably okay.
         self.Q_star_lambda = self._generate_Q_star_lambda()
 
-        # Generate the fitting_Q lambda, which takes a 4D vector and a, b and c as parameters.
-        self.Q_fitting_lambda = self._generate_fitting_Q_lambda()
-
         # Generate the grid over which to perform necessary numerical integrations.
-        self.axis_range = np.linspace(grid_range[0], grid_range[1], num_points_on_axis)
-        self.alpha_re_mesh, self.alpha_im_mesh, self.beta_re_mesh, self.beta_im_mesh = np.meshgrid(self.axis_range, self.axis_range, self.axis_range, self.axis_range, indexing = "ij")
+        self.num_points_on_axis = num_points_on_axis
+        self.axis_values = np.linspace(grid_range[0], grid_range[1], self.num_points_on_axis)
+        self.alpha_re_mesh, self.alpha_im_mesh, self.beta_re_mesh, self.beta_im_mesh = np.meshgrid(self.axis_values, self.axis_values, self.axis_values, self.axis_values, indexing = "ij")
 
         # Generate Q_star_values. These are constant for now and do not need to be updated (for constant a, b and c)
         self.Q_star_values = self.Q_star_lambda(self.alpha_re_mesh, self.alpha_im_mesh, self.beta_re_mesh, self.beta_im_mesh)
+        self.Q_star_values /= np.sum(self.Q_star_values)
 
         # Placeholder attributes for those that need to be evaluated with the specifics of the guard bands in mind.
         self.F_sym = None           # Symbolic representation of the filter function $F(\beta)$.
         self.p_pass = None          # Numerical value of the probability of passing the filter function.
         self.Q_PS_values = None     # Array of values of the Q function AFTER post-selection on a grid of points.
+        self.marginals = []         # List of marginal probability distributions for alpha_re, alpha_im, beta_re and beta_im.
+        self.marginal_means = []    # List of means for the marginal probability distributions for alpha_re, alpha_im, beta_re and beta_im.
         self.px = None              # Array containing marginal probability distribution values p(X = x).
         self.py = None              # Array containing marginal probability distribution values p(Y = y).
-        self.pxy = None             # 2D array containing joint probability distribution values p(X = x, Y = y).
-        self.effective_gamma = None # Effective Husimi-Q function covariance matrix for the post-selected state.
-        self.effective_cov_mat = None # Effective covariance matrix for the post-selected state.
+        self.effective_cov_mat = None # Effective covariance matrix of the post-selected state.
         self.a_PS = None            # Effective covariance matrix coefficient a_PS.
         self.b_PS = None            # Effective covariance matrix coefficient b_PS.
         self.c_PS = None            # Effective covariance matrix coefficient c_PS. 
@@ -94,25 +89,26 @@ class GBSR_quantum_statistics():
             Plot the marginal probability distributions p(X = x), p(Y = y) and p(X = x, Y = y) using the joint probability distribution p(alpha_re, alpha_im, beta_re, beta_im).
             This is set up to work in iPython environments, such as Jupyter notebooks.
         """
-
-
         # Set the figure size
         fig, axs = plt.subplots(1, 3, figsize=(15, 5))
 
         # Plot px
-        axs[0].plot(self.axis_range, self.px)
+        axs[0].plot(self.axis_values, self.px)
         axs[0].set_title('Plot of px')
         axs[0].set_xlabel('x')
         axs[0].set_ylabel('px')
 
         # Plot py
-        axs[1].plot(self.axis_range, self.py)
+        axs[1].plot(self.axis_values, self.py)
         axs[1].set_title('Plot of py')
         axs[1].set_xlabel('x')
         axs[1].set_ylabel('py')
 
         # Plot pxy using imshow, with the range set as axis_range \times axis_range
-        axs[2].imshow(self.pxy, extent=(self.axis_range[0], self.axis_range[-1], self.axis_range[0], self.axis_range[-1]), origin='lower')
+        # First, calculate a pxy marginal via techniques used in self._evaluate_effective_covariance_matrix(). That is, integrate over the imaginary parts.
+        pxy = np.sum(self.Q_PS_values, axis = (1, 3))
+        pxy /= np.sum(pxy)
+        axs[2].imshow(pxy, extent = (self.axis_values[0], self.axis_values[-1], self.axis_values[0], self.axis_values[-1]), origin='lower')
         axs[2].set_title('Heatmap of pxy')
         axs[2].set_xlabel('Index')
         axs[2].set_ylabel('Index')
@@ -140,8 +136,8 @@ class GBSR_quantum_statistics():
         # These values will shortly be normalised by division by p_pass.
         self.Q_PS_values = F_lambda(self.beta_re_mesh, self.beta_im_mesh) * self.Q_star_values
 
-        # Intergrate over the entire complex plane (using a 4D trapz) to find p_pass
-        self.p_pass = self._4D_trapz_over_Q(self.Q_PS_values)
+        # Integrate over the entire complex plane (using a 4D trapz) to find p_pass
+        self.p_pass = self._4D_integral_over_Q(self.Q_PS_values)
 
         # Divide through by p_pass to find normalise Q_PS_values
         self.Q_PS_values /= self.p_pass
@@ -235,92 +231,73 @@ class GBSR_quantum_statistics():
         """
             Evaluate the marginal probability distributions p(X = x), p(Y = y) and p(X = x, Y = y) using the joint probability distribution p(alpha_re, alpha_im, beta_re, beta_im).
         """
-        # Integrate out alpha_im and beta_im which correspond to axis = 3 and axis = 1 respectively.
-        self.pxy = np.trapz(np.trapz(self.Q_PS_values, self.axis_range, axis = 3), self.axis_range, axis = 1)
+        alpha_re_marginal = np.sum(self.Q_PS_values, axis = (1, 2, 3))
+        alpha_im_marginal = np.sum(self.Q_PS_values, axis = (0, 2, 3))
+        beta_re_marginal = np.sum(self.Q_PS_values, axis = (0, 1, 3))
+        beta_im_marginal = np.sum(self.Q_PS_values, axis = (0, 1, 2))
 
-        # Integrate out beta_re, which is axis = 1 for pxy.
-        self.px = np.trapz(self.pxy, self.axis_range, axis = 1)
+        # Normalise
+        alpha_re_marginal /= np.sum(alpha_re_marginal)
+        alpha_im_marginal /= np.sum(alpha_im_marginal)
+        beta_re_marginal /= np.sum(beta_re_marginal)
+        beta_im_marginal /= np.sum(beta_im_marginal)
 
-        # Integrate out alpha_re, which is axis = 0 for pxy.
-        self.py = np.trapz(self.pxy, self.axis_range, axis = 0)
+        # Assign marginals to px and py. For now, we choose the real elements.
+        self.px = alpha_re_marginal
+        self.py = beta_re_marginal
 
-        return self.px, self.py, self.pxy
+        # Store resulting values
+        self.marginals = [alpha_re_marginal, alpha_im_marginal, beta_re_marginal, beta_im_marginal]
+        self.marginal_means = [np.sum(self.marginals[i] * self.axis_values) for i in range(4)]
+
+        return self.marginals
+
+    def _evaluate_effective_covariance_matrix(self):
+        """
+            Evaluate the effective covariance matrix of the post-selected state via finding (co)variances of the appropriate marginals.
+
+        """
+        effective_husimi_cov_mat = np.zeros((4, 4))
+
+        # Initialise and calculate marginals (and their means).
+        self._evaluate_Q_PS_marginals()
+        joint_marginal = np.zeros((self.num_points_on_axis, self.num_points_on_axis))
+        
+        for i in range(4):
+            for j in range(4):
+                if j == i:
+                    # Leading diagonal elements are just variances of marginals
+                    effective_husimi_cov_mat[i][i] = np.sum((self.axis_values - self.marginal_means[i])**2 * self.marginals[i])
+                    continue
+
+                # Off-diagonal elements are covariances of marginals. First, calculate joint marginal and normalise.
+                joint_marginal = np.sum(self.Q_PS_values, axis = tuple(k for k in [0, 1, 2, 3] if k not in [i, j]))
+                joint_marginal /= np.sum(joint_marginal)
+
+                # Use joint marginal to calculate covariance
+                effective_husimi_cov_mat[i][j] = np.sum(joint_marginal * np.outer(self.axis_values - self.marginal_means[i], self.axis_values - self.marginal_means[j])) - (self.marginal_means[i] * self.marginal_means[j])
+        
+        # The covariance matrix of the state is therefore the effective husimi covariance matrix minus the identity matrix.
+        self.effective_cov_mat = effective_husimi_cov_mat - np.eye(4)
+
+        return self.effective_cov_mat
 
     def _evaluate_a_PS_b_PS_c_PS(self):
         """
             Evaluate the effective covariance matrix coefficients for the given post-selected
             state represented in Q_PS_values.
         """
-        # self.effective_gamma_inv = np.linalg.inv(self._evaluate_effective_gamma())
+        self.effective_cov_mat = self._evaluate_effective_covariance_matrix()
 
-        # self.effective_cov_mat = self.effective_gamma_inv - np.eye(4)
-
-        # self.a_PS = self.effective_cov_mat[0][0]
-        # self.b_PS = self.effective_cov_mat[2][2]
-        # self.c_PS = self.effective_cov_mat[0][2]
-
-        # return self.a_PS, self.b_PS, self.c_PS
-
-        coords = np.vstack([self.alpha_re_mesh.flatten(), self.alpha_im_mesh.flatten(), self.beta_re_mesh.flatten(), self.beta_im_mesh.flatten()])
-        Q_vals_flat = self.Q_PS_values.ravel()
-
-        popt, pcov = curve_fit(self.Q_fitting_lambda, coords, Q_vals_flat, p0 = [self.a, self.b, self.c], method = "trf") # Method does not require 4D Jacobian (let alone Hessian)
-
-        self.a_PS, self.b_PS, self.c_PS = popt
+        self.a_PS = self.effective_cov_mat[0][0]
+        self.b_PS = self.effective_cov_mat[2][2]
+        self.c_PS = self.effective_cov_mat[0][2]
 
         return self.a_PS, self.b_PS, self.c_PS
 
-    def _4D_trapz_over_Q(self, integrand_values):
-        # Perform integration over each axis using np.trapz
-        integral = np.trapz(integrand_values, x = self.axis_range)
-        integral = np.trapz(integral, x = self.axis_range)
-        integral = np.trapz(integral, x = self.axis_range)
-        integral = np.trapz(integral, x = self.axis_range)
-
-        return integral
-
-    def _evaluate_effective_gamma(self):
-        """
-            For now, brute force all the 4x4 matrix elements of the covariance matrix.
-            Going to do the full 4D integration for now so as to not assume real \equiv im invariance.
-
-            NOTE: This is redundant and mainly for debugging purposes. You do not need to recreate the entire gamma matrix to read off a_PS, b_PS and c_PS.
-        """
-        self.effective_gamma = np.zeros((4, 4))
-
-        mesh_vals = [self.alpha_re_mesh, self.alpha_im_mesh, self.beta_re_mesh, self.beta_im_mesh]
-
-        for i, vals_i in enumerate(mesh_vals):
-            for j, vals_j in enumerate(mesh_vals):
-                self.effective_gamma[i][j] = self._4D_trapz_over_Q(vals_i * vals_j * self.Q_PS_values)
-        
-        return self.effective_gamma
-
-    def _generate_fitting_Q_lambda(self):
-        """
-            Generate the fitting_Q lambda, which takes a 4D vector and a, b and c as parameters.
-            Importantly, a, b and c are NOT constant, in constrast to Q_star_lambda etc.
-        """
-        Q_fitting = sp.lambdify(
-            (   #function arguments
-                (self.alpha_re_sym, self.alpha_im_sym, self.beta_re_sym, self.beta_im_sym), # coords
-                self.a_sym,
-                self.b_sym,
-                self.c_sym
-            ),
-            self.Q_star_sym.subs(
-                [
-                    (self.alpha_sym, self.alpha_re_sym + self.alpha_im_sym*1j), # alpha = alpha_re + i alpha_im
-                    (self.beta_sym, self.beta_re_sym + self.beta_im_sym*1j),    # beta = beta_re + i beta_im
-                ]
-            ).simplify(),
-        )
-
-        if self.JIT:
-            # Q_fitting = vectorize(["void(float64[:], float64, float64, float64)"], "(n),(),(),()->()", target='parallel')(Q_fitting)
-            Q_fitting = njit(Q_fitting)
-        
-        return Q_fitting
+    def _4D_integral_over_Q(self, integrand_values):
+        # Perform summation over each axis using np.sum
+        return np.sum(integrand_values)
 
 class GBSR(GBSR_quantum_statistics):
     def __init__(
@@ -346,7 +323,7 @@ class GBSR(GBSR_quantum_statistics):
         self.p_pass, self.Q_PS_values = self._evaluate_p_pass_and_Q_PS_values(self.tau_arr, self.g_arr)
 
         # Evaluate marginals for now.
-        self.px, self.py, self.pxy = self._evaluate_Q_PS_marginals()
+        self._evaluate_Q_PS_marginals()
         
     def evaluate_key_rate_in_bits_per_pulse(self, m, tau_arr, g_arr):
         """
