@@ -6,6 +6,12 @@ from scipy.integrate import nquad, dblquad
 from scipy.optimize import curve_fit
 from scipy.stats import multivariate_normal, norm
 import time
+from pprint import pprint
+import numpy as np
+import sympy as sp
+import seaborn as sb
+
+
 
 class GBSR_quantum_statistics():
     def __init__(
@@ -13,10 +19,11 @@ class GBSR_quantum_statistics():
             modulation_variance,
             transmittance,
             excess_noise,
-            grid_range = [-8, 8],
+            grid_range = [-10, 10],
             num_points_on_axis = 64,
             JIT = True
         ) -> None:
+        # print("__init__")
         """
         Class arguments:
             modulation_variance: Alice's modulation variance $V_\\text{mod}$.
@@ -66,6 +73,7 @@ class GBSR_quantum_statistics():
         ).pdf
         self.Q_star_values = self.Q_star_lambda(np.stack((self.alpha_re_mesh, self.alpha_im_mesh, self.beta_re_mesh, self.beta_im_mesh), axis = -1))
         self.Q_star_values /= np.sum(self.Q_star_values)
+        # print(f"\t sum(self.Q_star_values) = {np.sum(self.Q_star_values)}")
 
         # Placeholder attributes for those that need to be evaluated with the specifics of the guard bands in mind.
         self.F_sym = None               # Symbolic representation of the filter function $F(\beta)$.
@@ -83,10 +91,15 @@ class GBSR_quantum_statistics():
         self.c_PS = None                # Effective covariance matrix coefficient c_PS.
 
     def plot_marginals_PS(self):
+        # print("plot_marginals_PS")
         """
             Plot the marginal probability distributions p(X = x), p(Y = y) and p(X = x, Y = y) using the joint probability distribution p(alpha_re, alpha_im, beta_re, beta_im).
             This is set up to work in iPython environments, such as Jupyter notebooks.
         """
+        # Evaluate marginals if they have not been evaluated yet.
+        if self.px_PS is None or self.py_PS is None or self.pxy_PS is None:
+            self._evaluate_Q_PS_marginals()
+
         # Set the figure size
         fig, axs = plt.subplots(1, 3, figsize=(15, 5))
 
@@ -115,6 +128,7 @@ class GBSR_quantum_statistics():
         plt.show()
 
     def _evaluate_p_pass_and_Q_PS_values(self, tau_arr, g_arr):
+        # print("_evaluate_p_pass_and_Q_PS_values")
         """
         Evaluate the probability of passing the filter function by integrating over (F(\beta) \times Q*(\alpha, \beta)) over the entire complex plane.
 
@@ -124,22 +138,32 @@ class GBSR_quantum_statistics():
             g_arr: array(float)
                 An array holding the values of $g_{\pm, i}$. g[i][0] contains $g_{i,-}$ and g[i][1] contains $g_{i,+}$.
         """
-        F_lambda = self._generate_F_lambda(tau_arr, g_arr)
+        # Generate the filter function $F(\beta)$ with the given guard band properties.
+        F_sym = self._define_filter_function(self.m)
+
+        F_lambda = self._generate_F_lambda(F_sym, tau_arr, g_arr)
 
         # Find F * Q_star, in numerical form.
         # We store the intermediate (unnormalised) Q_PS_values for later use in self.QS_PS_values for now.
         # These values will shortly be normalised by division by p_pass.
         self.Q_PS_values = F_lambda(self.beta_re_mesh, self.beta_im_mesh) * self.Q_star_values
 
+        # print(f"\t sum(self.Q_PS_values) = {np.sum(self.Q_PS_values)}")
+
         # Integrate over the entire complex plane (using a 4D trapz) to find p_pass
         self.p_pass = self._4D_integral_over_Q(self.Q_PS_values)
+
+        # print("\t p_pass:", self.p_pass)
 
         # Divide through by p_pass to find normalise Q_PS_values
         self.Q_PS_values /= self.p_pass
 
+        # print(f"\t sum(self.Q_PS_values) = {np.sum(self.Q_PS_values)}")
+
         return self.p_pass, self.Q_PS_values
 
-    def _generate_F_lambda(self, tau_arr, g_arr):
+    def _generate_F_lambda(self, F_sym, tau_arr, g_arr):
+        # print("_generate_F_lambda")
         """
         Substitute the guard band properties into the filter function $F(\beta)$.
 
@@ -151,18 +175,21 @@ class GBSR_quantum_statistics():
             g_arr: array(float)
                 An array holding the values of $g_{\pm, i}$. g[i][0] contains $g_{i,-}$ and g[i][1] contains $g_{i,+}$.
         """
+        F_sym_with_conditions = F_sym.subs(
+            [(sp.Symbol(f'g_minus{i}'), g_arr[i][0]) for i in range(len(g_arr))] +
+            [(sp.Symbol(f'g_plus{i}'), g_arr[i][1]) for i in range(len(g_arr))] +
+            [(sp.Symbol(f'taus{i}'), tau_arr[i]) for i in range(len(tau_arr))] +
+            [(self.beta_sym, self.beta_re_sym + self.beta_im_sym*1j)]
+        ).simplify()
+
         return sp.lambdify(
             (self.beta_re_sym, self.beta_im_sym),
-            self.F_sym.subs(
-                [(sp.Symbol(f'g_minus{i}'), g_arr[i][0]) for i in range(len(g_arr))] +
-                [(sp.Symbol(f'g_plus{i}'), g_arr[i][1]) for i in range(len(g_arr))] +
-                [(sp.Symbol(f'taus{i}'), tau_arr[i]) for i in range(len(tau_arr))] +
-                [(self.beta_sym, self.beta_re_sym + self.beta_im_sym*1j)]
-            ),
+            F_sym_with_conditions,
             "numpy"
         )
 
     def _define_filter_function(self, m):
+        # print("_define_filter_function")
         """
         Define the filter function $F(\beta)$ in sympy. This is done in a standalone function as it is quite an involved process.
 
@@ -195,11 +222,12 @@ class GBSR_quantum_statistics():
         self.F_sym = sp.Piecewise(
             (0, sp.Or(*conditions)),
             (1, True)
-        )
+        ).simplify()
 
         return self.F_sym
 
     def _generate_Q_star_lambda(self):
+        # print("_generate_Q_star_lambda")
         """
             Generate the Q function (subject to no post-selection, hence Q_star) for a given covariance matrix in a lambda function, that is JIT compiled.
             IMPORTANT: Due to needing real integrands for scipy.integrate.nquad, the Q function is evaluated with the real and imaginary parts of alpha and beta as separate arguments.
@@ -223,9 +251,13 @@ class GBSR_quantum_statistics():
         return self.Q_star_lambda
 
     def _evaluate_Q_PS_marginals(self):
+        # print("_evaluate_Q_PS_marginals")
         """
             Evaluate the marginal probability distributions of Q_PS p(X = x), p(Y = y) and p(X = x, Y = y) using the joint probability distribution p(alpha_re, alpha_im, beta_re, beta_im).
         """
+        if self.Q_PS_values is None:
+            raise ValueError("Q_PS_values have not been evaluated yet. Please evaluate Q_PS_values first.")
+
         alpha_re_marginal = np.sum(self.Q_PS_values, axis = (1, 2, 3))
         alpha_im_marginal = np.sum(self.Q_PS_values, axis = (0, 2, 3))
         beta_re_marginal = np.sum(self.Q_PS_values, axis = (0, 1, 3))
@@ -281,11 +313,15 @@ class GBSR_quantum_statistics():
 
         return self.cov_mat_PS
 
-    def _evaluate_a_PS_b_PS_c_PS(self):
+    def evaluate_a_PS_b_PS_c_PS(self, tau_arr, g_arr):
         """
             Evaluate the effective covariance matrix coefficients for the given post-selected
             state represented in Q_PS_values.
         """
+        # For the provided tau_arr and g_arr, calculate the appropriate Q_PS values:
+        self._evaluate_p_pass_and_Q_PS_values(tau_arr, g_arr)
+
+        # With Q_PS and p_pass evaluated, we can now find the effective covariance matrix.
         self.cov_mat_PS = self._evaluate_effective_covariance_matrix()
 
         self.a_PS = self.cov_mat_PS[0][0]
@@ -303,9 +339,12 @@ class GBSR(GBSR_quantum_statistics):
             m,
             modulation_variance,
             transmittance,
-            excess_noise
+            excess_noise,
+            grid_range = [-10, 10],
+            num_points_on_axis = 64,
+            JIT = True
         ) -> None:
-        super().__init__(modulation_variance, transmittance, excess_noise)
+        super().__init__(modulation_variance, transmittance, excess_noise, grid_range = grid_range, num_points_on_axis = num_points_on_axis, JIT = JIT)
 
         self.large_negative = -1e10
         self.large_positive = 1e10
@@ -313,31 +352,40 @@ class GBSR(GBSR_quantum_statistics):
         self.m = m
         self.number_of_intervals = 2**m
 
-        # Define the symbolic filter function
-        self.F_sym = self._define_filter_function(m)
-
-        # TODO: Define tau_arr and g_arr in a more general way.
-        self.tau_arr = np.array([-np.inf, 0.0, np.inf])
-        self.g_arr = np.array([[0.0, 0.0], [0.0, 0.0], [0.0, 0.0]])
-
-        # Evaluate the probability of passing the filter function and the Q function after post-selection.
-        self.p_pass, self.Q_PS_values = self._evaluate_p_pass_and_Q_PS_values(self.tau_arr, self.g_arr)
-
-    def evaluate_key_rate_in_bits_per_pulse(self, tau_arr, g_arr):
+    def evaluate_key_rate_in_bits_per_pulse(
+            self,
+            tau_arr,
+            g_arr,
+            quantisation_entropy = None,
+            classical_leaked_information = None,
+            error_rate = None,
+            holevo_information = None
+        ):
+        # print("evaluate_key_rate_in_bits_per_pulse")
         """
             Evaluate the key rate for GBSR with a given number of slices $m$ and an array holding each interval edge, and a 2D array holding the relative guard band spans.
-        """
-        
-        # Evaluate a_PS, b_PS and c_PS for use in finding the Holevo information.
-        a, b, c = self._evaluate_a_PS_b_PS_c_PS()
 
-        quantisation_entropy = self._evaluate_quantisation_entropy(tau_arr)
-        classical_leaked_information = self._binary_entropy(self._evaluate_error_rate(tau_arr, g_arr))
-        holevo_information = self._evaluate_holevo_information(a, b, c)
+            Can pass parts of the key rate calculation to avoid redundant calculations.
+        """
+
+        if quantisation_entropy is None:
+            quantisation_entropy = self.evaluate_quantisation_entropy(tau_arr)
+        
+        if classical_leaked_information is None:
+            if error_rate is None:
+                error_rate = self.evaluate_error_rate(tau_arr, g_arr)
+            
+            classical_leaked_information = self._binary_entropy(error_rate)
+        
+        if holevo_information is None:
+            self.evaluate_a_PS_b_PS_c_PS(tau_arr, g_arr)
+
+            holevo_information = self._evaluate_holevo_information(self.a_PS, self.b_PS, self.c_PS)
 
         return self.p_pass * (quantisation_entropy - classical_leaked_information - holevo_information)
 
-    def _evaluate_error_rate(self, tau_arr, g_arr):
+    def evaluate_error_rate(self, tau_arr, g_arr):
+        # print("evaluate_error_rate")
         """
             Evaluate the error rate of the protocol.
 
@@ -366,7 +414,8 @@ class GBSR(GBSR_quantum_statistics):
 
         return error_rate
 
-    def _evaluate_quantisation_entropy(self, tau_arr):
+    def evaluate_quantisation_entropy(self, tau_arr):
+        # print("evaluate_quantisation_entropy")
         """
             Evaluate the quantisation entropy of the protocol.
 
@@ -377,6 +426,7 @@ class GBSR(GBSR_quantum_statistics):
         return -1.0 * np.sum([interval_probabilities[i] * np.log2(interval_probabilities[i]) for i in range(self.number_of_intervals)])
 
     def _evaluate_mutual_information(self):
+        # print("_evaluate_mutual_information")
         """
             Evaluate the mutual information between Alice and Bob's probability distributions.
             This will later be done via numerical integration but the known analytical form can be read off for now.
@@ -384,6 +434,7 @@ class GBSR(GBSR_quantum_statistics):
         pass
 
     def _evaluate_holevo_information(self, a, b, c):
+        # print("_evaluate_holevo_information")
         """
             An upper bound for the Holevo information using the calculated covariance matrix. 
             See first-year report or (Laudenbach 2018) for more details.
@@ -400,6 +451,7 @@ class GBSR(GBSR_quantum_statistics):
         return self._g(nu[0]) + self._g(nu[1]) - self._g(nu[2])
 
     def _g(self, x):
+        # print("_g")
         """
             Needed to find the correct contrubution to the Holevo information for each symplectic eigenvalue from the appropriate covariance matrix.
         """
@@ -411,6 +463,7 @@ class GBSR(GBSR_quantum_statistics):
         return ((x + 1.0) / 2.0) * np.log2((x + 1.0) / 2.0) - ((x - 1.0) / 2.0) * np.log2((x - 1.0) / 2.0)
 
     def _integrate_1D_gaussian_pdf(self, lims, std_dev, mean = 0.0) -> float:
+        # print("_integrate_1D_gaussian_pdf")
         # Find the integral by subtracting two values from the cumulative probability function.
 
         # Replace any infinite limits with large numbers
@@ -421,6 +474,7 @@ class GBSR(GBSR_quantum_statistics):
         return rv.cdf(lims[1]) - rv.cdf(lims[0])
 
     def _integrate_2D_gaussian_pdf(self, xlims, ylims, cov_matrix, mean = [0.0, 0.0]) -> float:
+        # print("_integrate_2D_gaussian_pdf")
         # Integrate the joint PDF over the given limits. As the area needed is rectangular, we can subtract cdf values
         # similarly to the 1D case.
         rv = multivariate_normal(mean = mean, cov = cov_matrix)
@@ -440,18 +494,24 @@ class GBSR(GBSR_quantum_statistics):
         return (rv.cdf([x2, y2]) - rv.cdf([x2, y1]) - rv.cdf([x1, y2]) + rv.cdf([x1, y1]))
 
     def _binary_entropy(self, e):
+        # print("_binary_entropy")
         me = 1.0 - e
         return - (e * np.log2(e)) - (me * np.log2(me))
 
 if __name__ == "__main__":
-    from pprint import pprint
-    import numpy as np
-    import sympy as sp
-    import seaborn as sb
     import matplotlib.pyplot as plt
 
-    gbsr = GBSR(1, 1.0, 1.0, 0.0)
+    gbsr = GBSR(1, 2.2, 0.32, 0.02)
 
-    gbsr.evaluate_key_rate_in_bits_per_pulse(gbsr.tau_arr, gbsr.g_arr)
+    tau_arr = np.array([-np.inf, 0.0, np.inf])
+    g_arr = np.array([[0.0, 0.0], [1.5, 1.5], [0.0, 0.0]])
+
+    gbsr._evaluate_p_pass_and_Q_PS_values(tau_arr, g_arr)
+
+    gbsr.plot_marginals_PS()
+
+    print("Sum px_PS:", np.sum(gbsr.px_PS))
+    print("Sum py_PS:", np.sum(gbsr.py_PS))
+    print("Sum pxy_PS:", np.sum(gbsr.pxy_PS))
 
     
