@@ -76,9 +76,7 @@ class GBSR_quantum_statistics():
         # print(f"\t sum(self.Q_star_values) = {np.sum(self.Q_star_values)}")
 
         # Placeholder attributes for those that need to be evaluated with the specifics of the guard bands in mind.
-        self.F_sym = None               # Symbolic representation of the filter function $F(\beta)$.
         self.p_pass = None              # Numerical value of the probability of passing the filter function. 
-
         self.marginals_PS = []          # List of marginal probability distributions for alpha_re, alpha_im, beta_re and beta_im.
         self.marginal_PS_means = []     # List of means for the marginal probability distributions for alpha_re, alpha_im, beta_re and beta_im.
         self.px_PS = None               # Array containing post-selection marginal probability distribution values p(X = x).
@@ -130,18 +128,19 @@ class GBSR_quantum_statistics():
     def _evaluate_p_pass_and_Q_PS_values(self, tau_arr, g_arr):
         # print("_evaluate_p_pass_and_Q_PS_values")
         """
-        Evaluate the probability of passing the filter function by integrating over (F(\beta) \times Q*(\alpha, \beta)) over the entire complex plane.
+        Evaluate the probability of passing the filter function by integrating over (F(\\beta) \\times Q*(\\alpha, \\beta)) over the entire complex plane.
+
+        # TODO: Maybe split this into two methods: one for p_pass and one for Q_PS. However, p_pass is found during the 
+        intermediate step of finding Q_PS, so it may be more efficient to keep them together.
 
         Arguments:
             tau_arr: array(float)
-                An array holding the values of $\tau_i$.
+                An array holding the values of $\\tau_i$.
             g_arr: array(float)
                 An array holding the values of $g_{\pm, i}$. g[i][0] contains $g_{i,-}$ and g[i][1] contains $g_{i,+}$.
         """
         # Generate the filter function $F(\beta)$ with the given guard band properties.
-        F_sym = self._define_filter_function(self.m)
-
-        F_lambda = self._generate_F_lambda(F_sym, tau_arr, g_arr)
+        F_lambda = self._generate_F_lambda(tau_arr, g_arr)
 
         # Find F * Q_star, in numerical form.
         # We store the intermediate (unnormalised) Q_PS_values for later use in self.QS_PS_values for now.
@@ -162,7 +161,40 @@ class GBSR_quantum_statistics():
 
         return self.p_pass, self.Q_PS_values
 
-    def _generate_F_lambda(self, F_sym, tau_arr, g_arr):
+    def _generate_F_lambda(self, tau_arr, g_arr):
+        """
+            Generate a function which takes two complex numbers as parameters.
+
+            Arguments:
+                tau_arr: np.array(float)
+                    A numpy array holding the values of $\\tau_i$.
+                g_arr: np.array(float)
+                    A numpy array holding the values of $g_{\pm, i}$. g[i][0] contains $g_{i,-}$ and g[i][1] contains $g_{i,+}$.
+        """
+
+        def filter_function(b_real, b_imag):
+            x_real = b_real - tau_arr
+            x_imag = b_imag - tau_arr
+
+            # Check if there exists any element within the guard band bounds for both real and imaginary parts
+            condition_real = (-g_arr[:, 0] <= x_real) & (x_real <= g_arr[:, 1])
+            condition_imag = (-g_arr[:, 0] <= x_imag) & (x_imag <= g_arr[:, 1])
+
+            # If any condition is met in either real or imaginary part, return 0
+            if np.any(condition_real) or np.any(condition_imag):
+                return 0
+            return 1
+        
+        # First, JIT compile the filter function
+        if self.JIT:
+            filter_function = njit(filter_function)
+        
+        # Then, vectorize the function using np.vectorize
+        filter_function_callable = np.vectorize(filter_function)
+
+        return filter_function_callable
+
+    def _generate_F_lambda_legacy(self, F_sym, tau_arr, g_arr):
         # print("_generate_F_lambda")
         """
         Substitute the guard band properties into the filter function $F(\beta)$.
