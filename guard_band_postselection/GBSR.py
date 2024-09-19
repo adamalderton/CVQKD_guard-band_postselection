@@ -1,6 +1,5 @@
 import numpy as np
 import sympy as sp
-# from numba import njit
 from tqdm import tqdm
 import matplotlib.pyplot as plt
 from scipy.stats import multivariate_normal, norm
@@ -12,13 +11,7 @@ class GBSR_quantum_statistics():
         Should be integrated into the GBSR class as a parent.
     """
 
-    def __init__(
-            self,
-            modulation_variance,
-            transmittance,
-            excess_noise,
-            progress_bar = False
-    ):
+    def __init__(self, modulation_variance, transmittance, excess_noise, progress_bar = False):
         """
             Initialise the class with the given parameters.
 
@@ -26,7 +19,6 @@ class GBSR_quantum_statistics():
                 modulation_variance: Alice's modulation variance $V_\\text{mod}$.
                 transmittance: Transmissivity $T$ of the channel.
                 excess_noise: Excess noise $\\xi$ of the channel.
-                JIT: A flag to signal the use of Just-In-Time compilation.
         """
         
         self.progress_bar = progress_bar
@@ -41,7 +33,7 @@ class GBSR_quantum_statistics():
         # Covariance matrix coefficients derived from the above
         self.a = self.alice_variance
         self.b = self.bob_variance
-        self.c = np.sqrt(self.transmittance * (self.alice_variance*self.alice_variance - 1))
+        self.c = np.sqrt(self.transmittance * (self.alice_variance**2 - 1))
 
         # Initialise (2D marginalised) covariance matrix and its coefficients a, b and c using sympy. Numerical values can be substituted in later.
         self.a_sym, self.b_sym, self.c_sym = sp.symbols('a b c', real = True, positive = True)
@@ -50,17 +42,20 @@ class GBSR_quantum_statistics():
             [self.c_sym, self.b_sym]
         ])
 
-        # Initialise 'random variables' to integrate over.
+        # Initialise 'random variables' for Alice and Bob respectively. These should be integrated over with methods .pdf(x) and .cdf(x) etc.
         self.px_rv = norm(loc = 0.0, scale = np.sqrt(self.alice_variance)) # Alice's random variable
         self.py_rv = norm(loc = 0.0, scale = np.sqrt(self.bob_variance))   # Bob's random variable
-        self.Q_star_rv = multivariate_normal(mean = np.zeros(2), cov = np.array([[self.a, self.c], [self.c, self.b]])) # The joint random variable Q*.
+        
+        # Substitute a, b and c in the covariance matrix, and add np.eye(2) as this is the Husimi-Q function covariance matrix, NOT the state covariance matrix.
+        Q_star_cov_mat = self.cov_mat_sym.subs({self.a_sym: self.a, self.b_sym: self.b, self.c_sym: self.c}) + np.eye(2)
+        self.Q_star_rv = multivariate_normal(mean = np.zeros(2), cov = Q_star_cov_mat) # The joint random variable Q*.
 
         # Placeholder attributes for those that need to be evaluated with the specifics of the guard bands in mind.
         self.p_pass = None              # Numerical value of the probability of passing the filter function. 
         self.a_PS = None                # Effective covariance matrix coefficient a_PS.
         self.b_PS = None                # Effective covariance matrix coefficient b_PS.
         self.c_PS = None                # Effective covariance matrix coefficient c_PS.
-        self.cov_mat_PS = None        # Effective covariance matrix of the (2D marginal of the) post-selected state.
+        self.cov_mat_PS = None          # Effective covariance matrix of the (2D marginal of the) post-selected state.
 
         # Placeholder attributes for arrays that hold marginal distribution values, FOR PLOTTING PURPOSES ONLY. These should not be used as part of any numerics.
         self.px_PS_values = None        # Array containing post-selection marginal probability distribution values p(X = x).
@@ -115,7 +110,16 @@ class GBSR_quantum_statistics():
                 g_arr: array(float)
                     An array holding the values of $g_{\\pm, i}$. g[i][0] contains $g_{i,-}$ and g[i][1] contains $g_{i,+}$.
         """
-        self.p_pass = sum(self._integrate_1D_gaussian_pdf(self.py_rv, [tau_arr[i] + g_arr[i][1], tau_arr[i + 1] - g_arr[i][0]]) for i in range(len(tau_arr) - 1))
+        p_pass = 0.0
+
+        for i in range(len(tau_arr) - 1):
+            p_pass += self._integrate_1D_gaussian_pdf(
+                self.py_rv, # Bob's random variable, NOT post-selected
+                [tau_arr[i] + g_arr[i][1], tau_arr[i + 1] - g_arr[i + 1][0]]
+            )
+
+        self.p_pass = p_pass
+
         return self.p_pass
 
     def evaluate_cov_mat_PS(self, tau_arr, g_arr):
@@ -132,7 +136,7 @@ class GBSR_quantum_statistics():
                 g_arr: np.array(float)
                     A numpy array holding the values of $g_{\\pm, i}$. g[i][0] contains $g_{i,-}$ and g[i][1] contains $g_{i,+}$.
         """
-        e_x, var_x, e_y, var_y, cov_xy = self._compute_Q_PS_moments(self.Q_star_rv, tau_arr, g_arr)
+        var_x, var_y, cov_xy = self._compute_Q_PS_moments(self.Q_star_rv, tau_arr, g_arr)
 
         # Populate the covariance matrix of the Husimi-Q function for the post-selected state.
         effective_husimi_cov_mat = np.zeros((2, 2))
@@ -191,8 +195,10 @@ class GBSR_quantum_statistics():
 
     def _compute_Q_PS_moments(self, rv, tau_arr, g_arr):
         """
-            Compute the mean, variance, and covariance of x and y over specified limits for a 2D Gaussian distribution,
+            Compute the variance and covariance of x and y over specified limits for a 2D Gaussian distribution,
             considering exclusion zones (guard bands).
+
+            Note that this assumes E(x) = E(y) = 0.0. This assumption is valid for the GBSR protcol due to symmetry. This assumption is made to minimise numerical integrations.
 
             Parameters:
                 rv: scipy.stats.multivariate_normal object representing the 2D Gaussian distribution.
@@ -200,8 +206,21 @@ class GBSR_quantum_statistics():
                 g_arr: Widths of guard bands around each tau.
 
             Returns:
-                Means, variances, and covariance of x and y.
+                variances, and covariance of x and y.
         """
+
+        epsabs  = 1e-3
+        epsrel  = 1e-3
+
+        # Define integrands
+        def integrand_x2(y, x):
+            return x**2 * rv.pdf([x, y])
+
+        def integrand_y2(y, x):
+            return y**2 * rv.pdf([x, y])
+
+        def integrand_xy(y, x):
+            return x * y * rv.pdf([x, y])
 
         xlims = [-np.inf, np.inf]
         ylims = [-np.inf, np.inf]
@@ -218,22 +237,25 @@ class GBSR_quantum_statistics():
 
         # Exclude the guard bands from interval_list, like in _integrate_Q_PS
         for band_lower, band_upper in band_ranges:
+
             new_intervals = []
+
             for start, end in interval_list:
                 # Exclude guard bands
                 if band_upper <= start or band_lower >= end:
                     new_intervals.append([start, end])
                     continue
+
                 if band_lower > start:
                     new_intervals.append([start, band_lower])
+
                 if band_upper < end:
                     new_intervals.append([band_upper, end])
+
             interval_list = new_intervals
 
-        # Initialize numerators and denominator
-        E_X_num = 0.0
+        # Initialize numerators, to be later normalised by how much of the total distribution is considered
         E_X2_num = 0.0
-        E_Y_num = 0.0
         E_Y2_num = 0.0
         E_XY_num = 0.0  # For covariance
         norm_const = 0.0
@@ -247,60 +269,28 @@ class GBSR_quantum_statistics():
                 # Update normalization constant, by simply integrating p(x, y) over the allowed intervals
                 norm_const += self._integrate_2D_gaussian_pdf(rv, xlims, [y_start, y_end])
 
-                # Define integrands
-                def integrand_x(y, x):
-                    return x * rv.pdf([x, y])
-
-                def integrand_x2(y, x):
-                    return x**2 * rv.pdf([x, y])
-
-                def integrand_y(y, x):
-                    return y * rv.pdf([x, y])
-
-                def integrand_y2(y, x):
-                    return y**2 * rv.pdf([x, y])
-
-                def integrand_xy(y, x):
-                    return x * y * rv.pdf([x, y])
-
                 # Perform numerical integration
-                E_X_num += dblquad(
-                    integrand_x, xlims[0], xlims[1], lambda x: y_start, lambda x: y_end
-                )[0]
-
                 E_X2_num += dblquad(
-                    integrand_x2, xlims[0], xlims[1], lambda x: y_start, lambda x: y_end
-                )[0]
-
-                E_Y_num += dblquad(
-                    integrand_y, xlims[0], xlims[1], lambda x: y_start, lambda x: y_end
+                    integrand_x2, xlims[0], xlims[1], lambda x: y_start, lambda x: y_end, epsabs=epsabs, epsrel=epsrel
                 )[0]
 
                 E_Y2_num += dblquad(
-                    integrand_y2, xlims[0], xlims[1], lambda x: y_start, lambda x: y_end
+                    integrand_y2, xlims[0], xlims[1], lambda x: y_start, lambda x: y_end, epsabs=epsabs, epsrel=epsrel
                 )[0]
 
                 E_XY_num += dblquad(
-                    integrand_xy, xlims[0], xlims[1], lambda x: y_start, lambda x: y_end
+                    integrand_xy, xlims[0], xlims[1], lambda x: y_start, lambda x: y_end, epsabs=epsabs, epsrel=epsrel
                 )[0]
 
         if norm_const == 0.0:
             raise ValueError("Normalization constant is zero. Check the integration limits and guard bands.")
 
-        # Compute expected values and variances
-        E_X = E_X_num / norm_const
-        E_X2 = E_X2_num / norm_const
-        Var_X = E_X2 - E_X**2
+        # Compute (co)variances and return
+        var_x = E_X2_num / norm_const
+        var_y = E_Y2_num / norm_const
+        cov_xy = E_XY_num / norm_const
 
-        E_Y = E_Y_num / norm_const
-        E_Y2 = E_Y2_num / norm_const
-        Var_Y = E_Y2 - E_Y**2
-
-        # Compute covariance
-        E_XY = E_XY_num / norm_const
-        Cov_XY = E_XY - E_X * E_Y
-
-        return E_X, Var_X, E_Y, Var_Y, Cov_XY
+        return var_x, var_y, cov_xy
 
     def _integrate_Q_PS(self, xlims, ylims, tau_arr, g_arr):
         """
@@ -410,7 +400,35 @@ class GBSR(GBSR_quantum_statistics):
         self.m = m
         self.number_of_intervals = 2**m
 
-        self.naive_holevo_information = self._evaluate_holevo_information(self.a, self.b, self.c)
+        self.gaussian_attack_holevo_information = self._evaluate_holevo_information(self.a, self.b, self.c)
+
+    def plot_guard_band_diagram(self, tau_arr, g_arr):
+        """
+            Plot the guard band diagram for the GBSR protocol.
+            This method plots the guard band diagram for the GBSR protocol, showing the guard bands around each tau.
+        """
+        fig, ax = plt.subplots(figsize=(2.5 * plt.rcParams["figure.figsize"][0], plt.rcParams["figure.figsize"][1]))
+
+        # Plot a Gaussian of variance self.bob_variance
+        x = np.linspace(-2.5*self.py_rv.var(), 2.5*self.py_rv.var(), 200)
+        y = self.py_rv.pdf(x)
+        ax.plot(x, y, 'r-', label='Bob\'s marginal')
+
+        # Plot the guard bands
+        for i in range(len(tau_arr)):
+            # Plot interval centre (tau)
+            ax.plot([tau_arr[i], tau_arr[i]], [0, 1.1 * max(y)], 'k-')
+
+            # Plot left edge of guard band
+            ax.plot([tau_arr[i] - g_arr[i][0], tau_arr[i] - g_arr[i][0]], [0, 1.1 * max(y)], 'k--')
+
+            # Plot right edge of guard band
+            ax.plot([tau_arr[i] + g_arr[i][1], tau_arr[i] + g_arr[i][1]], [0, 1.1 * max(y)], 'k--')
+
+        ax.set_xlim([x[0], x[-1]])
+        ax.set_ylim([0, 1.2 * max(y)])
+
+        plt.show()
 
     def evaluate_key_rate_in_bits_per_pulse(
             self,
@@ -525,17 +543,14 @@ class GBSR(GBSR_quantum_statistics):
 if __name__ == "__main__":
     from tqdm import tqdm
 
-    gbsr = GBSR(1, 2.2, 0.6, 0.0, progress_bar=True)
+    gbsr = GBSR(1, 2.2, 0.4, 0.05, progress_bar=True)
 
     tau_arr = [-np.inf, 0.0, np.inf]
     g_arr = [
         [0.0, 0.0],
-        [0.5, 0.5],
+        [0.3, 0.3],
         [0.0, 0.0]
     ]
 
-    # gbsr.plot_marginals(tau_arr, g_arr, progress_bar=True)
-
-    print(gbsr.evaluate_key_rate_in_bits_per_pulse(tau_arr, g_arr))
-
+    gbsr.plot_marginals(tau_arr, g_arr)
     
