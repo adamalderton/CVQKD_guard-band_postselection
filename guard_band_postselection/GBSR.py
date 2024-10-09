@@ -456,33 +456,22 @@ class GBSR(GBSR_quantum_statistics):
             self,
             tau_arr,
             g_arr,
-            additional_code_redundancy = 0.0,
-            quantisation_entropy = None,
-            classical_leaked_information = None,
-            error_rate = None,
-            holevo_information = None,
-            p_pass = None
         ):
         """
             Evaluate the key rate for GBSR with a given number of slices $m$ and an array holding each interval edge, and a 2D array holding the relative guard band spans.
 
-            Can pass parts of the key rate calculation to avoid redundant calculations.
+            K_{\infty,\text{PS}} = p_\text{pass} \left(H(S_{1,\cdots,m} (1 - h(e)) - \chi \right)
+
         """
+        quantisation_entropy = self.evaluate_quantisation_entropy(tau_arr)
 
-        if quantisation_entropy is None:
-            quantisation_entropy = self.evaluate_quantisation_entropy(tau_arr)
-        
-        if classical_leaked_information is None:
-            if error_rate is None:
-                error_rate = self.evaluate_error_rate(tau_arr, g_arr)
-            
-            classical_leaked_information = (1.0 + additional_code_redundancy) * self._binary_entropy(error_rate)
+        error_rate = self.evaluate_error_rate(tau_arr, g_arr)
 
-        if p_pass is None:
-            p_pass = self.evaluate_p_pass(tau_arr, g_arr)
+        classical_leaked_information = self._evaluate_leaked_information(error_rate, quantisation_entropy)
         
-        if holevo_information is None:
-            holevo_information = self._evaluate_holevo_information(self.a, self.b, self.c)
+        holevo_information = self._evaluate_holevo_information(self.a, self.b, self.c)
+
+        p_pass = self.evaluate_p_pass(tau_arr, g_arr)
 
         return p_pass * (quantisation_entropy - classical_leaked_information - holevo_information)
 
@@ -517,6 +506,9 @@ class GBSR(GBSR_quantum_statistics):
         """
         interval_probabilities = [self._integrate_1D_gaussian_pdf(self.px_rv, [tau_arr[i], tau_arr[i+1]]) for i in range(self.number_of_intervals)]
         
+        # Remove 0.0 probabilities, as they will cause the entropy to be NaN, although in this limit we want 0.0.
+        interval_probabilities = [p for p in interval_probabilities if p != 0.0]
+
         return -1.0 * np.sum([interval_probabilities[i] * np.log2(interval_probabilities[i]) for i in range(self.number_of_intervals)])
 
     def _evaluate_mutual_information(self):
@@ -525,6 +517,9 @@ class GBSR(GBSR_quantum_statistics):
             This will later be done via numerical integration but the known analytical form can be read off for now.
         """
         pass
+
+    def _evaluate_leaked_information(self, error_rate, quantisation_entropy):
+        return quantisation_entropy * self._binary_entropy(error_rate)
 
     def _evaluate_holevo_information(self, a, b, c):
         """
