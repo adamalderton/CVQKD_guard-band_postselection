@@ -43,7 +43,6 @@ class GBSR_quantum_statistics():
         ])
 
         
-
         # Initialise 'random variables' for Alice and Bob respectively. These should be integrated over with methods .pdf(x) and .cdf(x) etc.
         self.px_rv = norm(loc = 0.0, scale = np.sqrt(self.alice_variance)) # Alice's random variable
         self.py_rv = norm(loc = 0.0, scale = np.sqrt(self.bob_variance))   # Bob's random variable
@@ -64,7 +63,7 @@ class GBSR_quantum_statistics():
         self.py_PS_values = None        # Array containing post-selection marginal probability distribution values p(Y = y).
         self.Q_PS_values = None         # Array containing post-selected joint probability distribution values p(X = x, Y = y).
 
-    def plot_marginals(self, tau_arr, g_arr, axis_range = [-10, 10], num_points_on_axis = 100, add_originals = False):
+    def plot_marginals(self, normalised_tau_arr, normalised_g_arr, axis_range = [-10, 10], num_points_on_axis = 100, add_originals = False):
         """
             Plot the marginal distributions and heatmap of joint distribution for postselected data.
             This method plots the marginal distributions p(x) and p(y), as well as the heatmap of the joint distribution p(x, y)
@@ -75,7 +74,7 @@ class GBSR_quantum_statistics():
             Returns:
                 None
         """
-        self._evaluate_marginals(tau_arr, g_arr, axis_range, num_points_on_axis)
+        self._evaluate_marginals(normalised_tau_arr, normalised_g_arr, axis_range, num_points_on_axis)
 
         axis_values = np.linspace(axis_range[0], axis_range[1], num_points_on_axis)
         
@@ -116,7 +115,7 @@ class GBSR_quantum_statistics():
         # Show the plot
         plt.show()
 
-    def evaluate_p_pass(self, tau_arr, g_arr):
+    def evaluate_p_pass(self, normalised_tau_arr, normalised_g_arr):
         """
             Evaluate the probability of passing the filter function by integrating over the 2D marginalised version: (F(y) \\times Q*(x, y)).
 
@@ -126,6 +125,10 @@ class GBSR_quantum_statistics():
                 g_arr: array(float)
                     An array holding the values of $g_{\\pm, i}$. g[i][0] contains $g_{i,-}$ and g[i][1] contains $g_{i,+}$.
         """
+        # Scale tau_arr and g_arr by Bob's standard deviation, such that they are in units of Bob's standard deviation.
+        tau_arr = np.sqrt(self.bob_variance) * np.array(normalised_tau_arr)
+        g_arr = np.sqrt(self.bob_variance) * np.array(normalised_g_arr)
+
         p_pass = 0.0
 
         for i in range(len(tau_arr) - 1):
@@ -138,7 +141,7 @@ class GBSR_quantum_statistics():
 
         return self.p_pass
 
-    def evaluate_cov_mat_PS(self, tau_arr, g_arr):
+    def evaluate_cov_mat_PS(self, normalised_tau_arr, normalised_g_arr):
         """
             Evaluate the covariance matrix of the post-selected state.
             This is done by evaluating the effective covariance matrix coefficients a_PS, b_PS and c_PS.
@@ -152,7 +155,7 @@ class GBSR_quantum_statistics():
                 g_arr: np.array(float)
                     A numpy array holding the values of $g_{\\pm, i}$. g[i][0] contains $g_{i,-}$ and g[i][1] contains $g_{i,+}$.
         """
-        var_x, var_y, cov_xy = self._compute_Q_PS_moments(self.Q_star_rv, tau_arr, g_arr)
+        var_x, var_y, cov_xy = self._compute_Q_PS_moments(self.Q_star_rv, normalised_tau_arr, normalised_g_arr)
 
         # Populate the covariance matrix of the Husimi-Q function for the post-selected state.
         effective_husimi_cov_mat = np.zeros((2, 2))
@@ -171,11 +174,15 @@ class GBSR_quantum_statistics():
 
         return self.cov_mat_PS
     
-    def _evaluate_marginals(self, tau_arr, g_arr, axis_range = [-10, 10], num_points_on_axis = 100):
+    def _evaluate_marginals(self, normalised_tau_arr, normalised_g_arr, axis_range = [-10, 10], num_points_on_axis = 100):
         """
             Evaluate the marginal distributions for post-selected data.
             This is done by evaluating the marginal distributions p(x) and p(y) for post-selected data.
         """
+        # Scale tau_arr and g_arr by Bob's standard deviation, such that they are in units of Bob's standard deviation, as is relevant for evaluating marginals.
+        tau_arr = np.sqrt(self.bob_variance) * np.array(normalised_tau_arr)
+        g_arr = np.sqrt(self.bob_variance) * np.array(normalised_g_arr)
+
         axis_values = np.linspace(axis_range[0], axis_range[1], num_points_on_axis)
 
         # Define the filter function
@@ -209,22 +216,18 @@ class GBSR_quantum_statistics():
 
         return self.px_PS_values, self.py_PS_values, self.Q_PS_values
 
-    def _compute_Q_PS_moments(self, rv, tau_arr, g_arr):
+    def _compute_Q_PS_moments(self, rv, normalised_tau_arr, normalised_g_arr):
         """
             Compute the variance and covariance of x and y over specified limits for a 2D Gaussian distribution,
             considering exclusion zones (guard bands).
 
             Note that this assumes E(x) = E(y) = 0.0. This assumption is valid for the GBSR protcol due to symmetry. This assumption is made to minimise numerical integrations.
-
-            Parameters:
-                rv: scipy.stats.multivariate_normal object representing the 2D Gaussian distribution.
-                tau_arr: Central values for guard bands.
-                g_arr: Widths of guard bands around each tau.
-
-            Returns:
-                variances, and covariance of x and y.
         """
+        # Scale tau_arr and g_arr by  Bob's standard deviations, such that they are in units of Bob's standard deviation.
+        y_tau_arr = np.sqrt(self.bob_variance) * np.array(normalised_tau_arr)
+        y_g_arr = np.array(normalised_g_arr) * np.sqrt(self.bob_variance)
 
+        # Low tolerances, as numerics are very expensive
         epsabs  = 1e-3
         epsrel  = 1e-3
 
@@ -241,11 +244,11 @@ class GBSR_quantum_statistics():
         xlims = [-np.inf, np.inf]
         ylims = [-np.inf, np.inf]
 
-        # Build guard band ranges in absolute terms
+        # Build guard band ranges in absolute terms (in Bob's standard deviation units)
         band_ranges = []
         for i in range(len(tau_arr)):
-            band_lower = tau_arr[i] - g_arr[i][0]
-            band_upper = tau_arr[i] + g_arr[i][1]
+            band_lower = y_tau_arr[i] - y_g_arr[i][0]
+            band_upper = y_tau_arr[i] + y_g_arr[i][1]
             band_ranges.append((band_lower, band_upper))
 
         # Initialize the list of allowed intervals with the initial limits
@@ -308,7 +311,7 @@ class GBSR_quantum_statistics():
 
         return var_x, var_y, cov_xy
 
-    def _integrate_Q_PS(self, xlims, ylims, tau_arr, g_arr):
+    def _integrate_Q_PS(self, xlims, ylims, normalised_tau_arr, normalised_g_arr):
         """
         Integrate the joint probability distribution of Q* and P_ps over the given limits,
         considering exclusion zones (guard bands) defined by tau_arr and g_arr.
@@ -326,16 +329,19 @@ class GBSR_quantum_statistics():
         Returns:
             float: The result of the integration.
         """
+        # Scale tau_arr and g_arr by Bob's standard deviation, such that they are in units of Bob's standard deviation.
+        y_tau_arr = np.sqrt(self.bob_variance) * np.array(normalised_tau_arr)
+        y_g_arr = np.sqrt(self.bob_variance) * np.array(normalised_g_arr)
+
         integral_result = 0.0
 
         y_lower = ylims[0]
         y_upper = ylims[1]
 
-        # Build guard band ranges, in absolute terms (not relative to tau)
         band_ranges = []
         for i in range(len(tau_arr)):
-            band_lower = tau_arr[i] - g_arr[i][0]
-            band_upper = tau_arr[i] + g_arr[i][1]
+            band_lower = y_tau_arr[i] - y_g_arr[i][0]
+            band_upper = y_tau_arr[i] + y_g_arr[i][1]
             band_ranges.append((band_lower, band_upper))
 
         # Initialize the list of allowed intervals with the initial limits
@@ -424,11 +430,15 @@ class GBSR(GBSR_quantum_statistics):
 
         self.devetak_winter = self.I_AB - self.gaussian_attack_holevo_information
 
-    def plot_guard_band_diagram(self, tau_arr, g_arr):
+    def plot_guard_band_diagram(self, normalised_tau_arr, normalised_g_arr):
         """
             Plot the guard band diagram for the GBSR protocol.
             This method plots the guard band diagram for the GBSR protocol, showing the guard bands around each tau.
         """
+        # Scale tau_arr and g_arr by Bob's standard deviation, such that they are in units of Bob's standard deviation.
+        tau_arr = np.sqrt(self.bob_variance) * np.array(normalised_tau_arr)
+        g_arr = np.sqrt(self.bob_variance) * np.array(normalised_g_arr)
+
         fig, ax = plt.subplots(figsize=(2.5 * plt.rcParams["figure.figsize"][0], plt.rcParams["figure.figsize"][1]))
 
         # Plot a Gaussian of variance self.bob_variance
@@ -475,12 +485,20 @@ class GBSR(GBSR_quantum_statistics):
 
         return p_pass * (quantisation_entropy - classical_leaked_information - holevo_information)
 
-    def evaluate_error_rate(self, tau_arr, g_arr):
+    def evaluate_error_rate(self, normalised_tau_arr, normalised_g_arr):
         """
             Evaluate the error rate of the protocol. Note that, of course, this operates on the statistics BEFORE post-selection.
 
             e = \\sum_{i = 0}^{2^m - 1} \\sum_{j = 0, j \neq i}^{2^m - 1} \\: \\int_{\tau_i}^{\tau_{i+1}} \\! dX \\int_{\tau_j + g_{j,+}}^{\tau_{j+1} - g_{j+1,-}} \\! dY \\: p_\text{joint}(X, Y) \\
         """
+
+        # As tau arr and g arr are passed as normalised, we need to scale them for the appropriate limits.
+        # For xlims, this is tantamount to scaling by Alice's standard deviation.
+        # For ylims, scale by Bob's standard deviation.
+        # The same can be applied to normalised_g_arr
+        x_tau_arr = np.sqrt(self.alice_variance) * np.array(normalised_tau_arr)
+        y_tau_arr = np.sqrt(self.bob_variance) * np.array(normalised_tau_arr)
+        y_g_arr = np.array(normalised_g_arr) * np.sqrt(self.bob_variance)
 
         error_rate = 0.0
 
@@ -490,20 +508,23 @@ class GBSR(GBSR_quantum_statistics):
                     continue
 
                 # Define the limits of integration for X and Y
-                xlims = [tau_arr[i], tau_arr[i + 1]]
-                ylims = [tau_arr[j] + g_arr[j][1], tau_arr[j + 1] - g_arr[j + 1][0]]
+                xlims = [x_tau_arr[i], x_tau_arr[i + 1]]
+                ylims = [y_tau_arr[j] + y_g_arr[j][1], y_tau_arr[j + 1] - y_g_arr[j + 1][0]]
 
                 # Integrate the joint PDF over the given limits.
                 error_rate += self._integrate_2D_gaussian_pdf(self.Q_star_rv, xlims, ylims)
 
         return error_rate
 
-    def evaluate_quantisation_entropy(self, tau_arr):
+    def evaluate_quantisation_entropy(self, normalised_tau_arr):
         """
             Evaluate the quantisation entropy of the protocol.
 
             H = - \\sum_{i = 0}^{2^m - 1} \\int_{\tau_i}^{\tau_{i+1}} \\! dX \\: p(X = x) \\log_2 p(X = x)
         """
+        # With normalised tau arr, scale using the standard deviation of Alice's random variable (self.px_rv), to retrieve tau_arr in units of Alice's standard deviation
+        tau_arr = [normalised_tau_arr[i] * np.sqrt(self.alice_variance) for i in range(len(normalised_tau_arr))]
+
         interval_probabilities = [self._integrate_1D_gaussian_pdf(self.px_rv, [tau_arr[i], tau_arr[i+1]]) for i in range(self.number_of_intervals)]
         
         # Remove 0.0 probabilities, as they will cause the entropy to be NaN, although in this limit we want 0.0.
