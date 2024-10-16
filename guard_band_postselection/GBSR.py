@@ -4,6 +4,7 @@ from tqdm import tqdm
 import matplotlib.pyplot as plt
 from scipy.stats import multivariate_normal, norm
 from scipy.integrate import dblquad
+from scipy.spatial.distance import hamming
 
 class GBSR_quantum_statistics():
     """
@@ -46,6 +47,7 @@ class GBSR_quantum_statistics():
         # Initialise 'random variables' for Alice and Bob respectively. These should be integrated over with methods .pdf(x) and .cdf(x) etc.
         self.px_rv = norm(loc = 0.0, scale = np.sqrt(self.alice_variance)) # Alice's random variable
         self.py_rv = norm(loc = 0.0, scale = np.sqrt(self.bob_variance))   # Bob's random variable
+        self.joint_rv = multivariate_normal(mean = np.zeros(2), cov = self.cov_mat) # The joint random variable.
         
         # Substitute a, b and c in the covariance matrix, and add np.eye(2) as this is the Husimi-Q function covariance matrix, NOT the state covariance matrix.
         Q_star_cov_mat = self.cov_mat + np.eye(2)
@@ -58,18 +60,20 @@ class GBSR_quantum_statistics():
         self.c_PS = None                # Effective covariance matrix coefficient c_PS.
         self.cov_mat_PS = None          # Effective covariance matrix of the (2D marginal of the) post-selected state.
 
-        # Placeholder attributes for arrays that hold marginal distribution values, FOR PLOTTING PURPOSES ONLY. These should not be used as part of any numerics.
-        self.px_PS_values = None        # Array containing post-selection marginal probability distribution values p(X = x).
-        self.py_PS_values = None        # Array containing post-selection marginal probability distribution values p(Y = y).
-        self.Q_PS_values = None         # Array containing post-selected joint probability distribution values p(X = x, Y = y).
+        # Placeholder attributes for arrays that hold Q-function marginal distribution values, FOR PLOTTING PURPOSES ONLY. These should not be used as part of any numerics.
+        self.px_Q_PS_values = None        # Array containing post-selection marginal probability distribution values p(X = x).
+        self.py_Q_PS_values = None        # Array containing post-selection marginal probability distribution values p(Y = y).
+        self.Q_PS_values = None           # Array containing post-selected joint probability distribution values p(X = x, Y = y).
 
-    def plot_marginals(self, normalised_tau_arr, normalised_g_arr, axis_range = [-10, 10], num_points_on_axis = 100, add_originals = False):
+    def plot_Q_marginals(self, normalised_tau_arr, normalised_g_arr, axis_range = [-10, 10], num_points_on_axis = 100, add_originals = False):
         """
-            Plot the marginal distributions and heatmap of joint distribution for postselected data.
-            This method plots the marginal distributions p(x) and p(y), as well as the heatmap of the joint distribution p(x, y)
+            TODO: Redo this to plot p(x) and p_PS(x). NOT the Husimi-Q function marginals. They are used for Holevo calculations only.
+            
+            Plot the marginal distributions and heatmap of the Husimi-Q function for postselected data.
+            This method plots the marginal distributions p_PSQ(x) and p_PSQ(y), as well as the heatmap of the joint distribution p_Q(x, y)
             for postselected data.
 
-            If add_originals is set to True, the original p(x) and p(y) will also be distributed.
+            If add_originals is set to True, the original p_Q(x) and p_Q(y) will also be distributed.
 
             Returns:
                 None
@@ -81,20 +85,20 @@ class GBSR_quantum_statistics():
         fig, axs = plt.subplots(1, 2, figsize=(15, 5))
 
         # Plot px
-        axs[0].plot(axis_values, self.px_PS_values, 'k-')
+        axs[0].plot(axis_values, self.px_Q_PS_values, 'k-')
         axs[0].set_title('Plot of px')
         axs[0].set_xlabel('x')
         axs[0].set_ylabel('p(x = X)')
 
         if add_originals:
-            # Evaluate the original p(x) for comparison, and normalise
+            # Evaluate the original p_Q(x) for comparison, and normalise
             originals = self.px_rv.pdf(axis_values)
             originals /= np.sum(originals)
 
             axs[0].plot(axis_values, originals, 'k--')
 
         # Plot py
-        axs[1].plot(axis_values, self.py_PS_values, 'k-')
+        axs[1].plot(axis_values, self.py_Q_PS_values, 'k-')
         axs[1].set_title('Plot of py')
         axs[1].set_xlabel('y')
         axs[1].set_ylabel('p(y = Y)')
@@ -176,8 +180,10 @@ class GBSR_quantum_statistics():
     
     def _evaluate_marginals(self, normalised_tau_arr, normalised_g_arr, axis_range = [-10, 10], num_points_on_axis = 100):
         """
-            Evaluate the marginal distributions for post-selected data.
-            This is done by evaluating the marginal distributions p(x) and p(y) for post-selected data.
+            TODO: Change this to evaluate p(x) and p_PS(x) instead of the Husimi-Q function marginals.
+
+            Evaluate the marginal distributions of Q() for post-selected data.
+            This is done by evaluating the marginal distributions p_Q(x) and p_Q(y) for post-selected data.
         """
         # Scale tau_arr and g_arr by Bob's standard deviation, such that they are in units of Bob's standard deviation, as is relevant for evaluating marginals.
         tau_arr = np.sqrt(self.bob_variance) * np.array(normalised_tau_arr)
@@ -209,12 +215,12 @@ class GBSR_quantum_statistics():
         self.Q_PS_values /= np.sum(self.Q_PS_values)
 
         # Sum over rows and columns to find px_PS_values and py_PS_values, and renormalise
-        self.px_PS_values = np.sum(self.Q_PS_values, axis=0)
-        self.py_PS_values = np.sum(self.Q_PS_values, axis=1)
-        self.px_PS_values /= np.sum(self.px_PS_values)
-        self.py_PS_values /= np.sum(self.py_PS_values)
+        self.px_Q_PS_values = np.sum(self.Q_PS_values, axis=0)
+        self.py_Q_PS_values = np.sum(self.Q_PS_values, axis=1)
+        self.px_Q_PS_values /= np.sum(self.px_Q_PS_values)
+        self.py_Q_PS_values /= np.sum(self.py_Q_PS_values)
 
-        return self.px_PS_values, self.py_PS_values, self.Q_PS_values
+        return self.px_Q_PS_values, self.py_Q_PS_values, self.Q_PS_values
 
     def _compute_Q_PS_moments(self, rv, normalised_tau_arr, normalised_g_arr):
         """
@@ -477,7 +483,7 @@ class GBSR(GBSR_quantum_statistics):
 
         error_rate = self.evaluate_error_rate(tau_arr, g_arr)
 
-        classical_leaked_information = self._evaluate_leaked_information(error_rate, quantisation_entropy)
+        classical_leaked_information = self._evaluate_leaked_information(error_rate)
         
         holevo_information = self._evaluate_holevo_information(self.a, self.b, self.c)
 
@@ -485,11 +491,11 @@ class GBSR(GBSR_quantum_statistics):
 
         return p_pass * (quantisation_entropy - classical_leaked_information - holevo_information)
 
-    def evaluate_error_rate(self, normalised_tau_arr, normalised_g_arr):
+    def evaluate_error_rate(self, normalised_tau_arr, normalised_g_arr, bit_assignment = "Gray"):
         """
             Evaluate the error rate of the protocol. Note that, of course, this operates on the statistics BEFORE post-selection.
 
-            e = \\sum_{i = 0}^{2^m - 1} \\sum_{j = 0, j \neq i}^{2^m - 1} \\: \\int_{\tau_i}^{\tau_{i+1}} \\! dX \\int_{\tau_j + g_{j,+}}^{\tau_{j+1} - g_{j+1,-}} \\! dY \\: p_\text{joint}(X, Y) \\
+            e = \sum_{i = 0}^{2^m - 1} \sum_{j = 0, j \neq i}^{2^m - 1} \: \int_{\tau_i}^{\tau_{i+1}} \! dX \int_{\tau_j + g_{j,+}}^{\tau_{j+1} - g_{j+1,-}} \! dY \: \frac{d_H(\mathbf{b}_i, \mathbf{b}_j)}{m} p(X, Y) \\
         """
 
         # As tau arr and g arr are passed as normalised, we need to scale them for the appropriate limits.
@@ -500,6 +506,14 @@ class GBSR(GBSR_quantum_statistics):
         y_tau_arr = np.sqrt(self.bob_variance) * np.array(normalised_tau_arr)
         y_g_arr = np.array(normalised_g_arr) * np.sqrt(self.bob_variance)
 
+        # Next, generate the bit assignment array
+        if bit_assignment == "Gray":
+            bit_strings = self._generate_gray_bit_assignment(self.m)
+        elif bit_assignment == "binary":
+            bit_strings = self._generate_binary_bit_assignment(self.m)
+        else:
+            raise ValueError("Invalid bit assignment scheme. Please choose 'Gray' or 'binary' or implement another.")
+
         error_rate = 0.0
 
         for i in range(self.number_of_intervals):
@@ -507,12 +521,15 @@ class GBSR(GBSR_quantum_statistics):
                 if i == j:
                     continue
 
+                # Calculate the normalised Hamming distance between the bit strings
+                normalised_Hamming_distance = self._hamming_distance(bit_strings[i], bit_strings[j]) / self.m
+
                 # Define the limits of integration for X and Y
                 xlims = [x_tau_arr[i], x_tau_arr[i + 1]]
                 ylims = [y_tau_arr[j] + y_g_arr[j][1], y_tau_arr[j + 1] - y_g_arr[j + 1][0]]
 
-                # Integrate the joint PDF over the given limits.
-                error_rate += self._integrate_2D_gaussian_pdf(self.Q_star_rv, xlims, ylims)
+                # Integrate the joint PDF over the given limits, and multiply by the normalised Hamming distance
+                error_rate += normalised_Hamming_distance * self._integrate_2D_gaussian_pdf(self.joint_rv, xlims, ylims)
 
         return error_rate
 
@@ -539,9 +556,57 @@ class GBSR(GBSR_quantum_statistics):
         """
         pass
 
-    def _evaluate_leaked_information(self, error_rate, quantisation_entropy):
-        return quantisation_entropy * self._binary_entropy(error_rate)
+    def _evaluate_leaked_information(self, error_rate):
+        return self.m * self._binary_entropy(error_rate)
 
+    def _evaluate_slepian_wolf_leaked_information(self, normalised_tau_arr, normalised_g_arr):
+        """
+        Calculate a lower bound on the amount of information leaked on the public channel, using the Slepian-Wolf theorem.
+
+        LEAK = H(S_{1, ..., m}(X) | Y)
+            = H(S_{1, ..., m}(X), Y) - H(Y)
+        """
+
+        # Step 1: Discretize y
+        num_y_points = 1000
+        sigma_Y = np.sqrt(self.bob_variance)
+        y_min = -5 * sigma_Y
+        y_max = 5 * sigma_Y
+        y_vals = np.linspace(y_min, y_max, num_y_points)
+        delta_y = y_vals[1] - y_vals[0]
+
+        # Step 2: Compute p(y)
+        p_y = np.array([self._compute_p_y(y_j) for y_j in y_vals])
+        epsilon = 1e-12
+        p_y = np.clip(p_y, epsilon, None)
+
+        # Step 3: Compute p(s_i, y)
+        num_intervals = self.number_of_intervals
+        p_s_y = np.zeros((num_intervals, num_y_points))
+
+        x_tau_arr = np.sqrt(self.alice_variance) * np.array(normalised_tau_arr)
+
+        for i in range(num_intervals):
+            xlims = [x_tau_arr[i], x_tau_arr[i+1]]
+            for idx, y_j in enumerate(y_vals):
+                p_s_y[i, idx] = self._integrate_pxy_over_x(xlims, y_j)
+
+        # Step 4: Compute p(s_i | y)
+        p_s_given_y = p_s_y / p_y
+
+        # Step 5: Compute H(S | Y = y_j)
+        H_S_given_y = np.zeros(num_y_points)
+
+        for idx in range(num_y_points):
+            p_s_given_y_j = p_s_given_y[:, idx]
+            p_s_given_y_j = np.clip(p_s_given_y_j, epsilon, None)
+            H_S_given_y[idx] = -np.sum(p_s_given_y_j * np.log2(p_s_given_y_j))
+
+        # Step 6: Compute H(S|Y)
+        H_S_given_Y = np.sum(H_S_given_y * p_y) * delta_y
+
+        return H_S_given_Y
+    
     def _evaluate_holevo_information(self, a, b, c):
         """
             An upper bound for the Holevo information using the calculated covariance matrix. 
@@ -576,42 +641,61 @@ class GBSR(GBSR_quantum_statistics):
         """
             Calculate the binary entropy of a given error rate.
         """
-        # e may be small negative or 0.0 due to numerical inprecisions. This is usually unintended, so we can evaluate H(e = 0.0) which is 0.0.
-        if e <= 0.0:
-            return 0.0
-        
+        if not 0.0 <= e <= 1.0:
+            raise ValueError("Error rate e must be between 0 and 1 inclusive.")
+
+        epsilon = 1e-15
+        e = min(max(e, epsilon), 1 - epsilon)
+
         one_minus_e = 1.0 - e
         return - (e * np.log2(e)) - (one_minus_e * np.log2(one_minus_e))
 
+    def _generate_gray_bit_assignment(self, m):
+        """
+            Generate the Gray bit assignment for the GBSR protocol.
+            Return an array of bit strings from 0 to 2^m - 1.
+        """
+        bit_strings = []
+
+        for i in range(2**m):
+            # The ith gray code is generated using the formula i ^ (i >> 1)
+            gray_code = i ^ (i >> 1)
+            # Format the gray code into a bit string with 'm' bits
+            bit_strings.append(f'{gray_code:0{m}b}')
+
+        return bit_strings
+    
+    def _generate_binary_bit_assignment(self, m):
+        """
+            Generate the binary bit assignment for the GBSR protocol.
+            Return an array of bit strings from 0 to 2^m - 1.
+        """
+        bit_strings = []
+
+        for i in range(2**m):
+            # Format the number 'i' as a binary string with 'm' bits
+            bit_strings.append(f'{i:0{m}b}')
+
+        return bit_strings
+    
+    def _hamming_distance(self, bit_string_1, bit_string_2):
+        """
+            Calculate the Hamming distance between two bit strings.
+        """
+        return sum([bit_string_1[i] != bit_string_2[i] for i in range(len(bit_string_1))])
+
 if __name__ == "__main__":
-    from tqdm import tqdm
+    # Example usage
 
-    # gbsr = GBSR(1, 2.2, 0.4, 0.05, progress_bar=True)
-
-    # tau_arr = [-np.inf, 0.0, np.inf]
-    # g_arr = [
-    #     [0.0, 0.0],
-    #     [0.3, 0.3],
-    #     [0.0, 0.0]
-    # ]
-
-    # gbsr.plot_marginals(tau_arr, g_arr)
-
-
-    # snrs = np.logspace(-3, 6, 100, base = 10.0)
-    snrs = np.linspace(10, 15, 10)
-    key_rates = []
-
+    gbsr = GBSR(1, 2.2, 0.4, 0.05, progress_bar=True)
 
     tau_arr = [-np.inf, 0.0, np.inf]
     g_arr = [
         [0.0, 0.0],
-        [0.0, 0.0],
+        [0.3, 0.3],
         [0.0, 0.0]
     ]
 
-    for snr in tqdm(snrs):
-        gbsr = GBSR(1, snr, 1.0, 0.0)
-        key_rates.append(gbsr.evaluate_key_rate_in_bits_per_pulse(tau_arr, g_arr, p_pass=1.0))
+    gbsr.plot_Q_marginals(tau_arr, g_arr)
 
     
