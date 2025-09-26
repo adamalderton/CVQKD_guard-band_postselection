@@ -1,10 +1,31 @@
 import numpy as np
-import sympy as sp
 from tqdm import tqdm
 import matplotlib.pyplot as plt
 from scipy.stats import multivariate_normal, norm
 from scipy.integrate import dblquad
 from scipy.spatial.distance import hamming
+from functools import lru_cache
+from scipy.stats import mvn
+
+@lru_cache(maxsize=None)
+def _rect_prob(mean_x, mean_y,
+               c00, c01, c10, c11,       # flattened cov entries
+               x1, x2, y1, y2):
+    """
+    P{ x1 < X ≤ x2 ,  y1 < Y ≤ y2 } for a 2-D Gaussian.
+    All arguments must be hashable (tuples / floats) so that lru_cache works.
+    """
+    mean = np.array([mean_x, mean_y], dtype=float)
+    cov  = np.array([[c00, c01],
+                     [c10, c11]], dtype=float)
+
+    lower = np.array([x1, y1], dtype=float)
+    upper = np.array([x2, y2], dtype=float)
+
+    p, info = mvn.mvnun(lower, upper, mean, cov)   # Alan Genz algorithm
+    if info != 0:
+        raise RuntimeError(f"mvnun did not converge (info={info})")
+    return float(p)
 
 class GBSR_quantum_statistics():
     """
@@ -28,24 +49,31 @@ class GBSR_quantum_statistics():
         self.transmittance = transmittance
         self.excess_noise = excess_noise
 
-        self.alice_variance = modulation_variance + 1.0                                # Alice's effective variance $V_A = $V_\\text{mod} + 1$ in SNU.
-        self.bob_variance = (transmittance * modulation_variance) + 1.0 + excess_noise # Bob's effective variance $V_B = T V_\\text{mod} + 1 + \\xi$ in SNU.
+        self.bob_variance = (0.5 * transmittance * modulation_variance) + 1.0 + (0.5 * excess_noise) # Bob's effective variance when using Heterodyne detection (in SNU).
 
-        self.SNR = (transmittance * modulation_variance) / (1.0 + excess_noise)        # Signal-to-noise ratio of the channel.
-        self.I_AB = 0.5 * np.log2(1.0 + self.SNR)
+        # SNR and I_AB, CONSIDERING DUAL HOMODYNE DETECTION. *NOT* SINGLE HOMODYNE DETECTION (note the missing factor of 1/2 outside I_AB). See Laudenbach-2018 for more info.
+        self.SNR = (transmittance * modulation_variance) / (2.0 + excess_noise)        # Signal-to-noise ratio of the channel.
+        self.I_AB = np.log2(1.0 + self.SNR)
 
-        # Covariance matrix coefficients derived from the above
-        self.a = self.alice_variance
-        self.b = self.bob_variance
-        self.c = np.sqrt(self.transmittance * (self.alice_variance**2 - 1))
-        self.cov_mat = np.array([
+        # TMSV covariance matrix coefficients derived from the above, considering heterodyne detection.
+        # See Laudenbach-2018 section 8.3 (Estimation of the covariance matrix) for more details.
+        # Note that these correspond to a^\text{EB} etc, to reflect the necessary covariance matrix values for the TMSV, as needed for the security analysis.
+        # Note that this is the TMSV covariance BEFORE any detection (dual-homodyne) in our case.
+        self.a = self.modulation_variance + 1.0
+        self.b = 2*self.bob_variance - 1.0
+        self.c = np.sqrt(
+            self.transmittance * (self.modulation_variance**2 + (2.0 * self.modulation_variance))
+        )
+
+
+        self.cov_mat_EB = np.array([
             [self.a, self.c],
             [self.c, self.b]
         ])
 
         
         # Initialise 'random variables' for Alice and Bob respectively. These should be integrated over with methods .pdf(x) and .cdf(x) etc.
-        self.px_rv = norm(loc = 0.0, scale = np.sqrt(self.alice_variance)) # Alice's random variable
+        self.px_rv = norm(loc = 0.0, scale = np.sqrt(self.modulation_variance)) # Alice's random variable
         self.py_rv = norm(loc = 0.0, scale = np.sqrt(self.bob_variance))   # Bob's random variable
         self.joint_rv = multivariate_normal(mean = np.zeros(2), cov = self.cov_mat) # The joint random variable.
         
@@ -252,7 +280,7 @@ class GBSR_quantum_statistics():
 
         # Build guard band ranges in absolute terms (in Bob's standard deviation units)
         band_ranges = []
-        for i in range(len(tau_arr)):
+        for i in range(len(y_tau_arr)):
             band_lower = y_tau_arr[i] - y_g_arr[i][0]
             band_upper = y_tau_arr[i] + y_g_arr[i][1]
             band_ranges.append((band_lower, band_upper))
@@ -405,18 +433,16 @@ class GBSR_quantum_statistics():
             xlims: A list or tuple with the limits of integration for the x-axis [x_lower, x_upper].
             ylims: A list or tuple with the limits of integration for the y-axis [y_lower, y_upper].
         """
-        # # Extract limits and set to a large magnitude if infinite
-        # x1 = xlims[0] if xlims[0] != -np.inf else -1e10
-        # x2 = xlims[1] if xlims[1] != np.inf else 1e10
-        # y1 = ylims[0] if ylims[0] != -np.inf else -1e10
-        # y2 = ylims[1] if ylims[1] != np.inf else 1e10
+        # Shortcut for the full plane
+        if np.isneginf(xlims[0]) and np.isposinf(xlims[1]) and np.isneginf(ylims[0]) and np.isposinf(ylims[1]):
+            return 1.0
 
-        # # Compute the probability inside the rectangle defined by the limits
-        # return (rv.cdf([x2, y2]) - rv.cdf([x2, y1]) - rv.cdf([x1, y2]) + rv.cdf([x1, y1]))
+        x1, x2 = xlims
+        y1, y2 = ylims
+        μx, μy = rv.mean
+        c00, c01, c10, c11 = rv.cov.ravel()
 
-        result, error = dblquad(lambda x, y: rv.pdf([x, y]), xlims[0], xlims[1], lambda x: ylims[0], lambda x: ylims[1])
-
-        return result
+        return _rect_prob(μx, μy, c00, c01, c10, c11, x1, x2, y1, y2)
 
 class GBSR(GBSR_quantum_statistics):
     def __init__(
@@ -425,16 +451,35 @@ class GBSR(GBSR_quantum_statistics):
             modulation_variance,
             transmittance,
             excess_noise,
+            _lambda = False,
+            Delta_QCT = 0.0,
             progress_bar = False
         ) -> None:
         super().__init__(modulation_variance, transmittance, excess_noise, progress_bar)
 
         self.m = m
         self.number_of_intervals = 2**m
+        self.Delta_QCT = Delta_QCT
+
+        # Determines whether to use the lambda overhead model
+        self._lambda = _lambda
 
         self.gaussian_attack_holevo_information = self._evaluate_holevo_information(self.a, self.b, self.c)
 
         self.devetak_winter = self.I_AB - self.gaussian_attack_holevo_information
+
+    def lambda_model(self, error_rate):
+        """
+            Calculate the lambda model for the GBSR protocol.
+            This is a placeholder function and should be replaced with the actual implementation.
+        """
+        # if isinstance(self, SR):
+        #     return 0.001
+        
+        # if TPT (=GBSR)
+        # return min((0.0006) / (0.5 - error_rate), 0.1)
+
+        return 0.001
 
     def plot_guard_band_diagram(self, normalised_tau_arr, normalised_g_arr):
         """
@@ -473,12 +518,12 @@ class GBSR(GBSR_quantum_statistics):
             tau_arr,
             g_arr,
         ):
-        """
-            Evaluate the key rate for GBSR with a given number of slices $m$ and an array holding each interval edge, and a 2D array holding the relative guard band spans.
+        # """
+        #     Evaluate the key rate for GBSR with a given number of slices $m$ and an array holding each interval edge, and a 2D array holding the relative guard band spans.
 
-            K_{\infty,\text{PS}} = p_\text{pass} \left(H(S_{1,\cdots,m} (1 - h(e)) - \chi \right)
+        #     K_{\infty,\text{PS}} = p_\text{pass} \left(H(S_{1,\cdots,m} (1 - h(e)) - \chi \right)
 
-        """
+        # """
         quantisation_entropy = self.evaluate_quantisation_entropy(tau_arr)
 
         error_rate = self.evaluate_error_rate(tau_arr, g_arr)
@@ -487,22 +532,24 @@ class GBSR(GBSR_quantum_statistics):
         
         holevo_information = self._evaluate_holevo_information(self.a, self.b, self.c)
 
+        QCT_leaked_information = self.Delta_QCT
+
         p_pass = self.evaluate_p_pass(tau_arr, g_arr)
 
-        return p_pass * (quantisation_entropy - classical_leaked_information - holevo_information)
+        return (p_pass * (quantisation_entropy - classical_leaked_information)) - (holevo_information + QCT_leaked_information)
 
     def evaluate_error_rate(self, normalised_tau_arr, normalised_g_arr, bit_assignment = "Gray"):
-        """
-            Evaluate the error rate of the protocol. Note that, of course, this operates on the statistics BEFORE post-selection.
+        # """
+        #     Evaluate the error rate of the protocol. Note that, of course, this operates on the statistics BEFORE post-selection.
 
-            e = \sum_{i = 0}^{2^m - 1} \sum_{j = 0, j \neq i}^{2^m - 1} \: \int_{\tau_i}^{\tau_{i+1}} \! dX \int_{\tau_j + g_{j,+}}^{\tau_{j+1} - g_{j+1,-}} \! dY \: \frac{d_H(\mathbf{b}_i, \mathbf{b}_j)}{m} p(X, Y) \\
-        """
+        #     e = \sum_{i = 0}^{2^m - 1} \sum_{j = 0, j \neq i}^{2^m - 1} \: \int_{\tau_i}^{\tau_{i+1}} \! dX \int_{\tau_j + g_{j,+}}^{\tau_{j+1} - g_{j+1,-}} \! dY \: \frac{d_H(\mathbf{b}_i, \mathbf{b}_j)}{m} p(X, Y) \\
+        # """
 
         # As tau arr and g arr are passed as normalised, we need to scale them for the appropriate limits.
         # For xlims, this is tantamount to scaling by Alice's standard deviation.
         # For ylims, scale by Bob's standard deviation.
         # The same can be applied to normalised_g_arr
-        x_tau_arr = np.sqrt(self.alice_variance) * np.array(normalised_tau_arr)
+        x_tau_arr = np.sqrt(self.modulation_variance) * np.array(normalised_tau_arr)
         y_tau_arr = np.sqrt(self.bob_variance) * np.array(normalised_tau_arr)
         y_g_arr = np.array(normalised_g_arr) * np.sqrt(self.bob_variance)
 
@@ -540,7 +587,7 @@ class GBSR(GBSR_quantum_statistics):
             H = - \\sum_{i = 0}^{2^m - 1} \\int_{\tau_i}^{\tau_{i+1}} \\! dX \\: p(X = x) \\log_2 p(X = x)
         """
         # With normalised tau arr, scale using the standard deviation of Alice's random variable (self.px_rv), to retrieve tau_arr in units of Alice's standard deviation
-        tau_arr = [normalised_tau_arr[i] * np.sqrt(self.alice_variance) for i in range(len(normalised_tau_arr))]
+        tau_arr = [normalised_tau_arr[i] * np.sqrt(self.modulation_variance) for i in range(len(normalised_tau_arr))]
 
         interval_probabilities = [self._integrate_1D_gaussian_pdf(self.px_rv, [tau_arr[i], tau_arr[i+1]]) for i in range(self.number_of_intervals)]
         
@@ -549,14 +596,12 @@ class GBSR(GBSR_quantum_statistics):
 
         return -1.0 * np.sum([interval_probabilities[i] * np.log2(interval_probabilities[i]) for i in range(self.number_of_intervals)])
 
-    def _evaluate_mutual_information(self):
-        """
-            Evaluate the mutual information between Alice and Bob's correlated Gaussian variables.
-            This will later be done via numerical integration but the known analytical form can be read off for now.
-        """
-        pass
-
     def _evaluate_leaked_information(self, error_rate):
+        if self._lambda:
+            # Use the lambda model
+            return (1.0 + self.lambda_model(error_rate)) * self.m * self._binary_entropy(error_rate)
+        
+        # Use the standard model
         return self.m * self._binary_entropy(error_rate)
 
     def _evaluate_slepian_wolf_leaked_information(self, normalised_tau_arr, normalised_g_arr):
@@ -584,7 +629,7 @@ class GBSR(GBSR_quantum_statistics):
         num_intervals = self.number_of_intervals
         p_s_y = np.zeros((num_intervals, num_y_points))
 
-        x_tau_arr = np.sqrt(self.alice_variance) * np.array(normalised_tau_arr)
+        x_tau_arr = np.sqrt(self.modulation_variance) * np.array(normalised_tau_arr)
 
         for i in range(num_intervals):
             xlims = [x_tau_arr[i], x_tau_arr[i+1]]
@@ -620,11 +665,17 @@ class GBSR(GBSR_quantum_statistics):
         nu[0] = 0.5 * (np.sqrt(sqrt_value) + (b - a))
         nu[1] = 0.5 * (np.sqrt(sqrt_value) - (b - a))
 
-        # Find the symplectic eigenvalue of the covariance matrix describing A conditioned on B.
+        # Find the symplectic eigenvalue of the covariance matrix describing A conditioned on B. (The '+1' is the only effect of heterodyne detection in this code)
         nu[2] = a - ((c**2) / (b + 1))
 
         # With all the necessary symplectic eigenvalues, we can now find the Holevo information:
         return self._g(nu[0]) + self._g(nu[1]) - self._g(nu[2])
+
+    def _evaluate_actual_mutual_information(self, normalised_tau_arr, normalised_g_arr):
+        pass
+
+    def _evaluate_postselected_devetak_winter(self, normalised_tau_arr, normalised_g_arr):
+        return self._evaluate_actual_mutual_information(normalised_tau_arr, normalised_g_arr) - self.gaussian_attack_holevo_information
 
     def _g(self, x):
         """
@@ -642,6 +693,7 @@ class GBSR(GBSR_quantum_statistics):
             Calculate the binary entropy of a given error rate.
         """
         if not 0.0 <= e <= 1.0:
+            print(f"Error rate: {e}")
             raise ValueError("Error rate e must be between 0 and 1 inclusive.")
 
         epsilon = 1e-15
@@ -683,6 +735,83 @@ class GBSR(GBSR_quantum_statistics):
             Calculate the Hamming distance between two bit strings.
         """
         return sum([bit_string_1[i] != bit_string_2[i] for i in range(len(bit_string_1))])
+
+class SR(GBSR):
+    """
+    Implements Van Assche et al. sliced reconciliation on top of the
+    Gaussian-band SR machinery already in `GBSR`.
+    """
+
+    def evaluate_key_rate_in_bits_per_pulse(self, tau_arr, g_arr):
+        quantisation_entropy = self.evaluate_quantisation_entropy(tau_arr)
+
+        self.slice_error_rates = self._evaluate_slice_error_rates(tau_arr, g_arr)
+
+        classical_leaked_information = self._evaluate_leaked_information()
+        
+        holevo_information = self._evaluate_holevo_information(self.a, self.b, self.c)
+
+        return quantisation_entropy - classical_leaked_information - holevo_information
+
+    def _evaluate_slice_error_rates(self,
+                                    tau_arr,
+                                    g_arr,
+                                    bit_assignment="Gray"):
+
+        # ---- reproduce the pre-processing that the parent does ------------
+        x_tau_arr = np.sqrt(self.modulation_variance) * np.array(tau_arr)
+        y_tau_arr = np.sqrt(self.bob_variance)       * np.array(tau_arr)
+        y_g_arr   = np.sqrt(self.bob_variance)       * np.array(g_arr)
+
+        if bit_assignment == "Gray":
+            bit_strings = self._generate_gray_bit_assignment(self.m)
+        elif bit_assignment == "binary":
+            bit_strings = self._generate_binary_bit_assignment(self.m)
+        else:
+            raise ValueError("bit_assignment must be 'Gray' or 'binary'")
+
+        # ---- actual slice-wise integration --------------------------------
+        slice_error_rates = np.zeros(self.m)
+
+        for k in range(self.m):                       # loop over bit position
+            e_k = 0.0
+            for i in range(self.number_of_intervals):
+                for j in range(self.number_of_intervals):
+                    if i == j:
+                        continue
+                    # does the k-th slice differ between intervals i and j?
+                    if bit_strings[i][k] != bit_strings[j][k]:
+                        xlims = [x_tau_arr[i],            x_tau_arr[i+1]]
+                        ylims = [y_tau_arr[j] + y_g_arr[j][1],
+                                 y_tau_arr[j+1] - y_g_arr[j+1][0]]
+
+                        e_k += self._integrate_2D_gaussian_pdf(
+                                    self.joint_rv, xlims, ylims)
+
+            slice_error_rates[k] = e_k
+
+        return slice_error_rates
+        
+    # Method override to use the sliced error rates
+    def _evaluate_leaked_information(self):
+        """
+            TODO: This does not take into account the overhead factor (λ) yet. 
+        """
+
+        if not hasattr(self, "slice_error_rates"):
+            raise RuntimeError("Call evaluate_SR_error_rates() first")
+        
+        if self._lambda:
+            return sum(
+                (1.0 + self.lambda_model(ei)) * self._binary_entropy(ei)
+                for ei in self.slice_error_rates
+            )
+
+        return sum(self._binary_entropy(ei)for ei in self.slice_error_rates)
+    
+    def evaluate_error_rate(self, *args, **kwargs):
+        # This method overrides the evaluate_error_rate method in the parent class.
+        pass
 
 if __name__ == "__main__":
     # Example usage
