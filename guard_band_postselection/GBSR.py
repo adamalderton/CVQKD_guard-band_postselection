@@ -1,618 +1,225 @@
+"""Guard-band sliced reconciliation protocol."""
+
+from __future__ import annotations
+
 import numpy as np
-from tqdm import tqdm
 import matplotlib.pyplot as plt
-from scipy.stats import multivariate_normal, norm
+from typing import Callable
 from scipy.integrate import dblquad
-from scipy.spatial.distance import hamming
-from functools import lru_cache
-from scipy.stats import mvn
+from scipy.stats import norm
+from tqdm import tqdm
 
-@lru_cache(maxsize=None)
-def _rect_prob(mean_x, mean_y,
-               c00, c01, c10, c11,       # flattened cov entries
-               x1, x2, y1, y2):
-    """
-    P{ x1 < X ≤ x2 ,  y1 < Y ≤ y2 } for a 2-D Gaussian.
-    All arguments must be hashable (tuples / floats) so that lru_cache works.
-    """
-    mean = np.array([mean_x, mean_y], dtype=float)
-    cov  = np.array([[c00, c01],
-                     [c10, c11]], dtype=float)
+from .key_efficiency_base import KeyEfficiencyBase
 
-    lower = np.array([x1, y1], dtype=float)
-    upper = np.array([x2, y2], dtype=float)
 
-    p, info = mvn.mvnun(lower, upper, mean, cov)   # Alan Genz algorithm
-    if info != 0:
-        raise RuntimeError(f"mvnun did not converge (info={info})")
-    return float(p)
+class GBSR(KeyEfficiencyBase):
+    """Guard-band sliced reconciliation keyed on the shared base machinery."""
 
-class GBSR_quantum_statistics():
-    """
-        A class to evaluate the quantum-statistics elements of the GBSR protocol.
-        Should be integrated into the GBSR class as a parent.
-    """
-
-    def __init__(self, modulation_variance, transmittance, excess_noise, progress_bar = False):
-        """
-            Initialise the class with the given parameters.
-
-            Class arguments:
-                modulation_variance: Alice's modulation variance $V_\\text{mod}$.
-                transmittance: Transmissivity $T$ of the channel.
-                excess_noise: Excess noise $\\xi$ of the channel.
-        """
-        
-        self.progress_bar = progress_bar
-
-        self.modulation_variance = modulation_variance
-        self.transmittance = transmittance
-        self.excess_noise = excess_noise
-
-        self.bob_variance = (0.5 * transmittance * modulation_variance) + 1.0 + (0.5 * excess_noise) # Bob's effective variance when using Heterodyne detection (in SNU).
-
-        # SNR and I_AB, CONSIDERING DUAL HOMODYNE DETECTION. *NOT* SINGLE HOMODYNE DETECTION (note the missing factor of 1/2 outside I_AB). See Laudenbach-2018 for more info.
-        self.SNR = (transmittance * modulation_variance) / (2.0 + excess_noise)        # Signal-to-noise ratio of the channel.
-        self.I_AB = np.log2(1.0 + self.SNR)
-
-        # TMSV covariance matrix coefficients derived from the above, considering heterodyne detection.
-        # See Laudenbach-2018 section 8.3 (Estimation of the covariance matrix) for more details.
-        # Note that these correspond to a^\text{EB} etc, to reflect the necessary covariance matrix values for the TMSV, as needed for the security analysis.
-        # Note that this is the TMSV covariance BEFORE any detection (dual-homodyne) in our case.
-        self.a = self.modulation_variance + 1.0
-        self.b = 2*self.bob_variance - 1.0
-        self.c = np.sqrt(
-            self.transmittance * (self.modulation_variance**2 + (2.0 * self.modulation_variance))
+    def __init__(
+        self,
+        m: int,
+        modulation_variance: float,
+        transmittance: float,
+        excess_noise: float,
+        *,
+        code_efficiency: float | Callable[[np.ndarray], np.ndarray] | None = 0.95,
+        Delta_QCT: float = 0.0,
+        leak_strategy: str = "error-rate",
+        progress_bar: bool = False,
+        holevo_strategy: str = "conservative",
+        shot_noise: float = 1.0,
+    ) -> None:
+        super().__init__(
+            modulation_variance,
+            transmittance,
+            excess_noise,
+            Delta_QCT=Delta_QCT,
+            leak_strategy=leak_strategy,
+            progress_bar=progress_bar,
+            shot_noise=shot_noise,
         )
 
+        self.set_code_efficiency(code_efficiency if code_efficiency is not None else 0.95)
 
-        self.cov_mat_EB = np.array([
-            [self.a, self.c],
-            [self.c, self.b]
-        ])
+        self.m = m
+        self.number_of_intervals = 2 ** m
+        allowed_strategies = {"conservative", "optimistic"}
+        strategy = holevo_strategy.lower()
+        if strategy not in allowed_strategies:
+            raise ValueError("holevo_strategy must be 'conservative' or 'optimistic'")
+        self.holevo_strategy = strategy
 
-        
-        # Initialise 'random variables' for Alice and Bob respectively. These should be integrated over with methods .pdf(x) and .cdf(x) etc.
-        self.px_rv = norm(loc = 0.0, scale = np.sqrt(self.modulation_variance)) # Alice's random variable
-        self.py_rv = norm(loc = 0.0, scale = np.sqrt(self.bob_variance))   # Bob's random variable
-        self.joint_rv = multivariate_normal(mean = np.zeros(2), cov = self.cov_mat) # The joint random variable.
-        
-        # Substitute a, b and c in the covariance matrix, and add np.eye(2) as this is the Husimi-Q function covariance matrix, NOT the state covariance matrix.
-        Q_star_cov_mat = self.cov_mat + np.eye(2)
-        self.Q_star_rv = multivariate_normal(mean = np.zeros(2), cov = Q_star_cov_mat) # The joint random variable Q*.
 
-        # Placeholder attributes for those that need to be evaluated with the specifics of the guard bands in mind.
-        self.p_pass = None              # Numerical value of the probability of passing the filter function. 
-        self.a_PS = None                # Effective covariance matrix coefficient a_PS.
-        self.b_PS = None                # Effective covariance matrix coefficient b_PS.
-        self.c_PS = None                # Effective covariance matrix coefficient c_PS.
-        self.cov_mat_PS = None          # Effective covariance matrix of the (2D marginal of the) post-selected state.
+        self.gaussian_attack_holevo_information = self._evaluate_holevo_information()
+        self.devetak_winter = self.I_AB - self.gaussian_attack_holevo_information
 
-        # Placeholder attributes for arrays that hold Q-function marginal distribution values, FOR PLOTTING PURPOSES ONLY. These should not be used as part of any numerics.
-        self.px_Q_PS_values = None        # Array containing post-selection marginal probability distribution values p(X = x).
-        self.py_Q_PS_values = None        # Array containing post-selection marginal probability distribution values p(Y = y).
-        self.Q_PS_values = None           # Array containing post-selected joint probability distribution values p(X = x, Y = y).
+    def plot_guard_band_diagram(self, normalised_tau_arr, normalised_g_arr) -> None:
+        """Plot Bob's marginal together with the guard bands."""
+        tau_arr = np.sqrt(self.bob_variance) * np.array(normalised_tau_arr)
+        g_arr = np.sqrt(self.bob_variance) * np.array(normalised_g_arr)
 
-    def plot_Q_marginals(self, normalised_tau_arr, normalised_g_arr, axis_range = [-10, 10], num_points_on_axis = 100, add_originals = False):
-        """
-            TODO: Redo this to plot p(x) and p_PS(x). NOT the Husimi-Q function marginals. They are used for Holevo calculations only.
-            
-            Plot the marginal distributions and heatmap of the Husimi-Q function for postselected data.
-            This method plots the marginal distributions p_PSQ(x) and p_PSQ(y), as well as the heatmap of the joint distribution p_Q(x, y)
-            for postselected data.
+        fig, ax = plt.subplots(figsize=(2.5 * plt.rcParams["figure.figsize"][0], plt.rcParams["figure.figsize"][1]))
 
-            If add_originals is set to True, the original p_Q(x) and p_Q(y) will also be distributed.
+        x = np.linspace(-2.5 * self.py_rv.var(), 2.5 * self.py_rv.var(), 200)
+        y = self.py_rv.pdf(x)
+        ax.plot(x, y, "r-", label="Bob's marginal")
 
-            Returns:
-                None
-        """
+        for i in range(len(tau_arr)):
+            ax.plot([tau_arr[i], tau_arr[i]], [0, 1.1 * max(y)], "k-")
+            ax.plot([tau_arr[i] - g_arr[i][0], tau_arr[i] - g_arr[i][0]], [0, 1.1 * max(y)], "k--")
+            ax.plot([tau_arr[i] + g_arr[i][1], tau_arr[i] + g_arr[i][1]], [0, 1.1 * max(y)], "k--")
+
+        ax.set_xlim([x[0], x[-1]])
+        ax.set_ylim([0, 1.2 * max(y)])
+        ax.legend()
+        plt.show()
+
+    def plot_Q_marginals(self, normalised_tau_arr, normalised_g_arr,
+                          axis_range=(-10, 10), num_points_on_axis=100, add_originals=False) -> None:
+        """Plot Husimi-Q marginals for the post-selected state."""
         self._evaluate_marginals(normalised_tau_arr, normalised_g_arr, axis_range, num_points_on_axis)
 
         axis_values = np.linspace(axis_range[0], axis_range[1], num_points_on_axis)
-        
+
         fig, axs = plt.subplots(1, 2, figsize=(15, 5))
 
-        # Plot px
-        axs[0].plot(axis_values, self.px_Q_PS_values, 'k-')
-        axs[0].set_title('Plot of px')
-        axs[0].set_xlabel('x')
-        axs[0].set_ylabel('p(x = X)')
+        axs[0].plot(axis_values, self.px_Q_PS_values, "k-")
+        axs[0].set_title("p(x)")
+        axs[0].set_xlabel("x")
+        axs[0].set_ylabel("Probability density")
 
         if add_originals:
-            # Evaluate the original p_Q(x) for comparison, and normalise
             originals = self.px_rv.pdf(axis_values)
             originals /= np.sum(originals)
+            axs[0].plot(axis_values, originals, "k--")
 
-            axs[0].plot(axis_values, originals, 'k--')
-
-        # Plot py
-        axs[1].plot(axis_values, self.py_Q_PS_values, 'k-')
-        axs[1].set_title('Plot of py')
-        axs[1].set_xlabel('y')
-        axs[1].set_ylabel('p(y = Y)')
+        axs[1].plot(axis_values, self.py_Q_PS_values, "k-")
+        axs[1].set_title("p(y)")
+        axs[1].set_xlabel("y")
+        axs[1].set_ylabel("Probability density")
 
         if add_originals:
-            # Evaluate the original p(y) for comparison, and normalise
             originals = self.py_rv.pdf(axis_values)
             originals /= np.sum(originals)
-            axs[1].plot(axis_values, originals, 'k--')
+            axs[1].plot(axis_values, originals, "k--")
 
-        # # Plot pxy using imshow, with the range set as axis_range \times axis_range
-        # axs[2].imshow(self.Q_PS_values, extent = (axis_values[0], axis_values[-1], axis_values[0], axis_values[-1]), origin = 'lower')
-        # axs[2].set_title('p(x = X, y = Y)')
-
-        # Adjust the spacing between subplots
         plt.tight_layout()
-
-        # Show the plot
         plt.show()
 
-    def evaluate_p_pass(self, normalised_tau_arr, normalised_g_arr):
-        """
-            Evaluate the probability of passing the filter function by integrating over the 2D marginalised version: (F(y) \\times Q*(x, y)).
+    def evaluate_key_rate_in_bits_per_pulse(self, tau_arr, g_arr) -> float:
+        metrics = self.evaluate_reconciliation_efficiency(tau_arr, g_arr)
+        return metrics["key_rate"]
 
-            Arguments:
-                tau_arr: array(float)
-                    An array holding the values of $\\tau_i$.
-                g_arr: array(float)
-                    An array holding the values of $g_{\\pm, i}$. g[i][0] contains $g_{i,-}$ and g[i][1] contains $g_{i,+}$.
-        """
-        # Scale tau_arr and g_arr by Bob's standard deviation, such that they are in units of Bob's standard deviation.
+    def evaluate_reconciliation_efficiency(
+        self,
+        tau_arr,
+        g_arr,
+        *,
+        code_efficiency=None,
+        bit_assignment="Gray",
+    ) -> dict[str, float]:
+        """Evaluate the guard-band reconciliation efficiency at fixed decoder speed."""
+        quantisation_entropy = self.evaluate_quantisation_entropy(tau_arr)
+        p_pass = self.evaluate_p_pass(tau_arr, g_arr)
+        raw_error = self.evaluate_error_rate(tau_arr, g_arr, bit_assignment=bit_assignment)
+        effective_error = self._effective_bsc_error(raw_error)
+        capacity = self._bsc_capacity(effective_error)
+        coding_efficiency = float(
+            self._evaluate_code_efficiency(np.array([effective_error]), override=code_efficiency)[0]
+        )
+        code_rate = float(coding_efficiency * capacity)
+        leak_per_bit = max(1.0 - code_rate, 0.0)
+        bits_sent = p_pass * quantisation_entropy
+        bits_leaked = p_pass * self.m * leak_per_bit
+        numerator = bits_sent - bits_leaked
+        denominator = max(self.I_AB, 1e-12)
+        eta = numerator / denominator if denominator > 0.0 else 0.0
+        if self.holevo_strategy == "optimistic":
+            self.evaluate_cov_mat_PS(tau_arr, g_arr)
+            holevo_information = self._evaluate_holevo_information(
+                self.a_PS, self.b_PS, self.c_PS
+            )
+            key_rate = numerator - (holevo_information + self.Delta_QCT)
+        else:
+            key_rate = numerator - self._holevo_with_qct()
+        return {
+            "eta": float(eta),
+            "bits_sent": float(bits_sent),
+            "bits_leaked": float(bits_leaked),
+            "key_rate": float(key_rate),
+            "p_pass": float(p_pass),
+            "raw_error_rate": float(raw_error),
+            "error_rate": float(effective_error),
+            "capacity": float(capacity),
+            "coding_efficiency": coding_efficiency,
+            "code_rate": float(code_rate),
+            "leak_per_bit": float(leak_per_bit),
+            "quantisation_entropy": float(quantisation_entropy),
+            "I_AB": self.I_AB,
+        }
+
+    def evaluate_error_rate(self, normalised_tau_arr, normalised_g_arr, bit_assignment="Gray") -> float:
+        x_tau_arr = np.sqrt(self.modulation_variance) * np.array(normalised_tau_arr)
+        y_tau_arr = np.sqrt(self.bob_variance) * np.array(normalised_tau_arr)
+        y_g_arr = np.sqrt(self.bob_variance) * np.array(normalised_g_arr)
+
+        if bit_assignment == "Gray":
+            bit_strings = self._generate_gray_bit_assignment(self.m)
+        elif bit_assignment == "binary":
+            bit_strings = self._generate_binary_bit_assignment(self.m)
+        else:
+            raise ValueError("Invalid bit assignment scheme. Choose 'Gray' or 'binary'.")
+
+        error_rate = 0.0
+        for i in range(self.number_of_intervals):
+            for j in range(self.number_of_intervals):
+                if i == j:
+                    continue
+
+                normalised_hamming_distance = self._hamming_distance(bit_strings[i], bit_strings[j]) / self.m
+                xlims = [x_tau_arr[i], x_tau_arr[i + 1]]
+                ylims = [y_tau_arr[j] + y_g_arr[j][1], y_tau_arr[j + 1] - y_g_arr[j + 1][0]]
+
+                error_rate += normalised_hamming_distance * self._integrate_2D_gaussian_pdf(
+                    self.joint_rv, xlims, ylims
+                )
+
+        return error_rate
+
+    def evaluate_p_pass(self, normalised_tau_arr, normalised_g_arr) -> float:
         tau_arr = np.sqrt(self.bob_variance) * np.array(normalised_tau_arr)
         g_arr = np.sqrt(self.bob_variance) * np.array(normalised_g_arr)
 
         p_pass = 0.0
-
         for i in range(len(tau_arr) - 1):
             p_pass += self._integrate_1D_gaussian_pdf(
-                self.py_rv, # Bob's random variable, NOT post-selected
-                [tau_arr[i] + g_arr[i][1], tau_arr[i + 1] - g_arr[i + 1][0]]
+                self.py_rv,
+                [tau_arr[i] + g_arr[i][1], tau_arr[i + 1] - g_arr[i + 1][0]],
             )
 
         self.p_pass = p_pass
-
         return self.p_pass
 
     def evaluate_cov_mat_PS(self, normalised_tau_arr, normalised_g_arr):
-        """
-            Evaluate the covariance matrix of the post-selected state.
-            This is done by evaluating the effective covariance matrix coefficients a_PS, b_PS and c_PS.
-            This is the main method to be called to interact with this class.
+        var_x, var_y, cov_xy = self._compute_Q_PS_moments(
+            self.Q_star_rv, normalised_tau_arr, normalised_g_arr
+        )
 
-            IMPORTANT: This method assums E(x) = E(y) = 0.0. This assumption is valid for the GBSR protcol due to symmetry. This assumption is made to minimise numerical integrations.
-
-            Arguments:
-                tau_arr: np.array(float)
-                    A numpy array holding the values of $\\tau_i$.
-                g_arr: np.array(float)
-                    A numpy array holding the values of $g_{\\pm, i}$. g[i][0] contains $g_{i,-}$ and g[i][1] contains $g_{i,+}$.
-        """
-        var_x, var_y, cov_xy = self._compute_Q_PS_moments(self.Q_star_rv, normalised_tau_arr, normalised_g_arr)
-
-        # Populate the covariance matrix of the Husimi-Q function for the post-selected state.
         effective_husimi_cov_mat = np.zeros((2, 2))
         effective_husimi_cov_mat[0][0] = var_x
         effective_husimi_cov_mat[1][1] = var_y
         effective_husimi_cov_mat[0][1] = cov_xy
         effective_husimi_cov_mat[1][0] = cov_xy
 
-        # Calculate covariance matrix of the post-selected state.
         self.cov_mat_PS = effective_husimi_cov_mat - np.eye(2)
-
-        # Extract a_PS, b_PS, and c_PS from the covariance matrix.
         self.a_PS = self.cov_mat_PS[0][0]
         self.b_PS = self.cov_mat_PS[1][1]
         self.c_PS = self.cov_mat_PS[0][1]
-
         return self.cov_mat_PS
-    
-    def _evaluate_marginals(self, normalised_tau_arr, normalised_g_arr, axis_range = [-10, 10], num_points_on_axis = 100):
-        """
-            TODO: Change this to evaluate p(x) and p_PS(x) instead of the Husimi-Q function marginals.
 
-            Evaluate the marginal distributions of Q() for post-selected data.
-            This is done by evaluating the marginal distributions p_Q(x) and p_Q(y) for post-selected data.
-        """
-        # Scale tau_arr and g_arr by Bob's standard deviation, such that they are in units of Bob's standard deviation, as is relevant for evaluating marginals.
-        tau_arr = np.sqrt(self.bob_variance) * np.array(normalised_tau_arr)
-        g_arr = np.sqrt(self.bob_variance) * np.array(normalised_g_arr)
-
-        axis_values = np.linspace(axis_range[0], axis_range[1], num_points_on_axis)
-
-        # Define the filter function
-        def filter_function(y):
-            # Start with a mask of ones (True)
-            mask = np.ones_like(y, dtype=bool)
-            for i in range(len(tau_arr)):
-                y_minus_tau = y - tau_arr[i]
-                condition = (-g_arr[i][0] <= y_minus_tau) & (y_minus_tau <= g_arr[i][1])
-                # Update mask: set to False where condition is True
-                mask &= ~condition
-            return mask.astype(int)  # Convert boolean mask to int (1 or 0)
-
-        # Find Q_PS_values first, then sum over rows and columns (and normalise) to find px_PS_values and py_PS_values.
-
-        # Generate a meshgrid for the 2D joint distribution
-        x_mesh, y_mesh = np.meshgrid(axis_values, axis_values)
-
-        # Evaluate Q_star(x, y) over the meshgrid
-        Q_star_values = self.Q_star_rv.pdf(np.dstack((x_mesh, y_mesh)))
-
-        # Apply the filter function to Q_star_values, and normalise
-        self.Q_PS_values = filter_function(y_mesh) * Q_star_values
-        self.Q_PS_values /= np.sum(self.Q_PS_values)
-
-        # Sum over rows and columns to find px_PS_values and py_PS_values, and renormalise
-        self.px_Q_PS_values = np.sum(self.Q_PS_values, axis=0)
-        self.py_Q_PS_values = np.sum(self.Q_PS_values, axis=1)
-        self.px_Q_PS_values /= np.sum(self.px_Q_PS_values)
-        self.py_Q_PS_values /= np.sum(self.py_Q_PS_values)
-
-        return self.px_Q_PS_values, self.py_Q_PS_values, self.Q_PS_values
-
-    def _compute_Q_PS_moments(self, rv, normalised_tau_arr, normalised_g_arr):
-        """
-            Compute the variance and covariance of x and y over specified limits for a 2D Gaussian distribution,
-            considering exclusion zones (guard bands).
-
-            Note that this assumes E(x) = E(y) = 0.0. This assumption is valid for the GBSR protcol due to symmetry. This assumption is made to minimise numerical integrations.
-        """
-        # Scale tau_arr and g_arr by  Bob's standard deviations, such that they are in units of Bob's standard deviation.
-        y_tau_arr = np.sqrt(self.bob_variance) * np.array(normalised_tau_arr)
-        y_g_arr = np.array(normalised_g_arr) * np.sqrt(self.bob_variance)
-
-        # Low tolerances, as numerics are very expensive
-        epsabs  = 1e-3
-        epsrel  = 1e-3
-
-        # Define integrands
-        def integrand_x2(y, x):
-            return x**2 * rv.pdf([x, y])
-
-        def integrand_y2(y, x):
-            return y**2 * rv.pdf([x, y])
-
-        def integrand_xy(y, x):
-            return x * y * rv.pdf([x, y])
-
-        xlims = [-np.inf, np.inf]
-        ylims = [-np.inf, np.inf]
-
-        # Build guard band ranges in absolute terms (in Bob's standard deviation units)
-        band_ranges = []
-        for i in range(len(y_tau_arr)):
-            band_lower = y_tau_arr[i] - y_g_arr[i][0]
-            band_upper = y_tau_arr[i] + y_g_arr[i][1]
-            band_ranges.append((band_lower, band_upper))
-
-        # Initialize the list of allowed intervals with the initial limits
-        interval_list = [[ylims[0], ylims[1]]]
-
-        # Exclude the guard bands from interval_list, like in _integrate_Q_PS
-        for band_lower, band_upper in band_ranges:
-
-            new_intervals = []
-
-            for start, end in interval_list:
-                # Exclude guard bands
-                if band_upper <= start or band_lower >= end:
-                    new_intervals.append([start, end])
-                    continue
-
-                if band_lower > start:
-                    new_intervals.append([start, band_lower])
-
-                if band_upper < end:
-                    new_intervals.append([band_upper, end])
-
-            interval_list = new_intervals
-
-        # Initialize numerators, to be later normalised by how much of the total distribution is considered
-        E_X2_num = 0.0
-        E_Y2_num = 0.0
-        E_XY_num = 0.0  # For covariance
-        norm_const = 0.0
-
-        if self.progress_bar:
-            interval_list = tqdm(interval_list)
-
-        # Integrate over the allowed intervals
-        for y_start, y_end in interval_list:
-            if y_end > y_start:
-                # Update normalization constant, by simply integrating p(x, y) over the allowed intervals
-                norm_const += self._integrate_2D_gaussian_pdf(rv, xlims, [y_start, y_end])
-
-                # Perform numerical integration
-                E_X2_num += dblquad(
-                    integrand_x2, xlims[0], xlims[1], lambda x: y_start, lambda x: y_end, epsabs=epsabs, epsrel=epsrel
-                )[0]
-
-                E_Y2_num += dblquad(
-                    integrand_y2, xlims[0], xlims[1], lambda x: y_start, lambda x: y_end, epsabs=epsabs, epsrel=epsrel
-                )[0]
-
-                E_XY_num += dblquad(
-                    integrand_xy, xlims[0], xlims[1], lambda x: y_start, lambda x: y_end, epsabs=epsabs, epsrel=epsrel
-                )[0]
-
-        if norm_const == 0.0:
-            raise ValueError("Normalization constant is zero. Check the integration limits and guard bands.")
-
-        # Compute (co)variances and return
-        var_x = E_X2_num / norm_const
-        var_y = E_Y2_num / norm_const
-        cov_xy = E_XY_num / norm_const
-
-        return var_x, var_y, cov_xy
-
-    def _integrate_Q_PS(self, xlims, ylims, normalised_tau_arr, normalised_g_arr):
-        """
-        Integrate the joint probability distribution of Q* and P_ps over the given limits,
-        considering exclusion zones (guard bands) defined by tau_arr and g_arr.
-
-        Arguments:
-            xlims: list(float)
-                The limits of integration for the x-axis.
-            ylims: list(float)
-                The limits of integration for the y-axis.
-            tau_arr: list(float)
-                Array of central values for the guard bands.
-            g_arr: list(tuple(float, float))
-                Array of tuples representing the lower and upper guard band widths around each tau.
-
-        Returns:
-            float: The result of the integration.
-        """
-        # Scale tau_arr and g_arr by Bob's standard deviation, such that they are in units of Bob's standard deviation.
-        y_tau_arr = np.sqrt(self.bob_variance) * np.array(normalised_tau_arr)
-        y_g_arr = np.sqrt(self.bob_variance) * np.array(normalised_g_arr)
-
-        integral_result = 0.0
-
-        y_lower = ylims[0]
-        y_upper = ylims[1]
-
-        band_ranges = []
-        for i in range(len(tau_arr)):
-            band_lower = y_tau_arr[i] - y_g_arr[i][0]
-            band_upper = y_tau_arr[i] + y_g_arr[i][1]
-            band_ranges.append((band_lower, band_upper))
-
-        # Initialize the list of allowed intervals with the initial limits
-        interval_list = [[y_lower, y_upper]]
-
-        # Exclude the guard bands from interval_list
-        for band_lower, band_upper in band_ranges:
-            new_intervals = []
-
-            for start, end in interval_list:
-
-                # If the guard band does not overlap with [start, end], keep the interval as is
-                if band_upper <= start or band_lower >= end:
-                    new_intervals.append([start, end])
-                    continue
-
-                # The guard band overlaps with the interval, therefore split the interval into up to two intervals, excluding the guard band
-
-                if band_lower > start:
-                    new_intervals.append([start, band_lower])
-                if band_upper < end:
-                    new_intervals.append([band_upper, end])
-
-                # If the guard band covers the whole interval, we don't add any interval
-
-            # Update the interval list
-            interval_list = new_intervals
-
-        # Integrate over the allowed intervals
-        for start, end in interval_list:
-            if (end > start):
-                integral_result += (1.0 / self.p_pass) * self._integrate_2D_gaussian_pdf(self.Q_star_rv, xlims, [start, end])
-
-        return integral_result
-
-    def _integrate_1D_gaussian_pdf(self, rv, lims) -> float:
-        """
-        Integrate the 1D Gaussian PDF over the specified limits.
-
-        Parameters:
-            rv: The random variable described by a 1D Gaussian distribution (scipy.stats.norm object).
-            lims: A list or tuple with the limits of integration [lower_limit, upper_limit].
-        """
-        x1 = lims[0] if lims[0] != -np.inf else -1e10
-        x2 = lims[1] if lims[1] != np.inf else 1e10
-
-        return rv.cdf(lims[1]) - rv.cdf(lims[0])
-
-    def _integrate_2D_gaussian_pdf(self, rv, xlims, ylims) -> float:
-        """
-        Integrate the 2D Gaussian PDF over the rectangle defined by xlims and ylims.
-
-        Parameters:
-            rv: The random variable described by a 2D Gaussian distribution (scipy.stats.multivariate_normal object).
-            xlims: A list or tuple with the limits of integration for the x-axis [x_lower, x_upper].
-            ylims: A list or tuple with the limits of integration for the y-axis [y_lower, y_upper].
-        """
-        # Shortcut for the full plane
-        if np.isneginf(xlims[0]) and np.isposinf(xlims[1]) and np.isneginf(ylims[0]) and np.isposinf(ylims[1]):
-            return 1.0
-
-        x1, x2 = xlims
-        y1, y2 = ylims
-        μx, μy = rv.mean
-        c00, c01, c10, c11 = rv.cov.ravel()
-
-        return _rect_prob(μx, μy, c00, c01, c10, c11, x1, x2, y1, y2)
-
-class GBSR(GBSR_quantum_statistics):
-    def __init__(
-            self,
-            m,
-            modulation_variance,
-            transmittance,
-            excess_noise,
-            _lambda = False,
-            Delta_QCT = 0.0,
-            progress_bar = False
-        ) -> None:
-        super().__init__(modulation_variance, transmittance, excess_noise, progress_bar)
-
-        self.m = m
-        self.number_of_intervals = 2**m
-        self.Delta_QCT = Delta_QCT
-
-        # Determines whether to use the lambda overhead model
-        self._lambda = _lambda
-
-        self.gaussian_attack_holevo_information = self._evaluate_holevo_information(self.a, self.b, self.c)
-
-        self.devetak_winter = self.I_AB - self.gaussian_attack_holevo_information
-
-    def lambda_model(self, error_rate):
-        """
-            Calculate the lambda model for the GBSR protocol.
-            This is a placeholder function and should be replaced with the actual implementation.
-        """
-        # if isinstance(self, SR):
-        #     return 0.001
-        
-        # if TPT (=GBSR)
-        # return min((0.0006) / (0.5 - error_rate), 0.1)
-
-        return 0.001
-
-    def plot_guard_band_diagram(self, normalised_tau_arr, normalised_g_arr):
-        """
-            Plot the guard band diagram for the GBSR protocol.
-            This method plots the guard band diagram for the GBSR protocol, showing the guard bands around each tau.
-        """
-        # Scale tau_arr and g_arr by Bob's standard deviation, such that they are in units of Bob's standard deviation.
-        tau_arr = np.sqrt(self.bob_variance) * np.array(normalised_tau_arr)
-        g_arr = np.sqrt(self.bob_variance) * np.array(normalised_g_arr)
-
-        fig, ax = plt.subplots(figsize=(2.5 * plt.rcParams["figure.figsize"][0], plt.rcParams["figure.figsize"][1]))
-
-        # Plot a Gaussian of variance self.bob_variance
-        x = np.linspace(-2.5*self.py_rv.var(), 2.5*self.py_rv.var(), 200)
-        y = self.py_rv.pdf(x)
-        ax.plot(x, y, 'r-', label='Bob\'s marginal')
-
-        # Plot the guard bands
-        for i in range(len(tau_arr)):
-            # Plot interval centre (tau)
-            ax.plot([tau_arr[i], tau_arr[i]], [0, 1.1 * max(y)], 'k-')
-
-            # Plot left edge of guard band
-            ax.plot([tau_arr[i] - g_arr[i][0], tau_arr[i] - g_arr[i][0]], [0, 1.1 * max(y)], 'k--')
-
-            # Plot right edge of guard band
-            ax.plot([tau_arr[i] + g_arr[i][1], tau_arr[i] + g_arr[i][1]], [0, 1.1 * max(y)], 'k--')
-
-        ax.set_xlim([x[0], x[-1]])
-        ax.set_ylim([0, 1.2 * max(y)])
-
-        plt.show()
-
-    def evaluate_key_rate_in_bits_per_pulse(
-            self,
-            tau_arr,
-            g_arr,
-        ):
-        # """
-        #     Evaluate the key rate for GBSR with a given number of slices $m$ and an array holding each interval edge, and a 2D array holding the relative guard band spans.
-
-        #     K_{\infty,\text{PS}} = p_\text{pass} \left(H(S_{1,\cdots,m} (1 - h(e)) - \chi \right)
-
-        # """
-        quantisation_entropy = self.evaluate_quantisation_entropy(tau_arr)
-
-        error_rate = self.evaluate_error_rate(tau_arr, g_arr)
-
-        classical_leaked_information = self._evaluate_leaked_information(error_rate)
-        
-        holevo_information = self._evaluate_holevo_information(self.a, self.b, self.c)
-
-        QCT_leaked_information = self.Delta_QCT
-
-        p_pass = self.evaluate_p_pass(tau_arr, g_arr)
-
-        return (p_pass * (quantisation_entropy - classical_leaked_information)) - (holevo_information + QCT_leaked_information)
-
-    def evaluate_error_rate(self, normalised_tau_arr, normalised_g_arr, bit_assignment = "Gray"):
-        # """
-        #     Evaluate the error rate of the protocol. Note that, of course, this operates on the statistics BEFORE post-selection.
-
-        #     e = \sum_{i = 0}^{2^m - 1} \sum_{j = 0, j \neq i}^{2^m - 1} \: \int_{\tau_i}^{\tau_{i+1}} \! dX \int_{\tau_j + g_{j,+}}^{\tau_{j+1} - g_{j+1,-}} \! dY \: \frac{d_H(\mathbf{b}_i, \mathbf{b}_j)}{m} p(X, Y) \\
-        # """
-
-        # As tau arr and g arr are passed as normalised, we need to scale them for the appropriate limits.
-        # For xlims, this is tantamount to scaling by Alice's standard deviation.
-        # For ylims, scale by Bob's standard deviation.
-        # The same can be applied to normalised_g_arr
-        x_tau_arr = np.sqrt(self.modulation_variance) * np.array(normalised_tau_arr)
-        y_tau_arr = np.sqrt(self.bob_variance) * np.array(normalised_tau_arr)
-        y_g_arr = np.array(normalised_g_arr) * np.sqrt(self.bob_variance)
-
-        # Next, generate the bit assignment array
-        if bit_assignment == "Gray":
-            bit_strings = self._generate_gray_bit_assignment(self.m)
-        elif bit_assignment == "binary":
-            bit_strings = self._generate_binary_bit_assignment(self.m)
-        else:
-            raise ValueError("Invalid bit assignment scheme. Please choose 'Gray' or 'binary' or implement another.")
-
-        error_rate = 0.0
-
-        for i in range(self.number_of_intervals):
-            for j in range(self.number_of_intervals):
-                if i == j:
-                    continue
-
-                # Calculate the normalised Hamming distance between the bit strings
-                normalised_Hamming_distance = self._hamming_distance(bit_strings[i], bit_strings[j]) / self.m
-
-                # Define the limits of integration for X and Y
-                xlims = [x_tau_arr[i], x_tau_arr[i + 1]]
-                ylims = [y_tau_arr[j] + y_g_arr[j][1], y_tau_arr[j + 1] - y_g_arr[j + 1][0]]
-
-                # Integrate the joint PDF over the given limits, and multiply by the normalised Hamming distance
-                error_rate += normalised_Hamming_distance * self._integrate_2D_gaussian_pdf(self.joint_rv, xlims, ylims)
-
-        return error_rate
-
-    def evaluate_quantisation_entropy(self, normalised_tau_arr):
-        """
-            Evaluate the quantisation entropy of the protocol.
-
-            H = - \\sum_{i = 0}^{2^m - 1} \\int_{\tau_i}^{\tau_{i+1}} \\! dX \\: p(X = x) \\log_2 p(X = x)
-        """
-        # With normalised tau arr, scale using the standard deviation of Alice's random variable (self.px_rv), to retrieve tau_arr in units of Alice's standard deviation
-        tau_arr = [normalised_tau_arr[i] * np.sqrt(self.modulation_variance) for i in range(len(normalised_tau_arr))]
-
-        interval_probabilities = [self._integrate_1D_gaussian_pdf(self.px_rv, [tau_arr[i], tau_arr[i+1]]) for i in range(self.number_of_intervals)]
-        
-        # Remove 0.0 probabilities, as they will cause the entropy to be NaN, although in this limit we want 0.0.
-        interval_probabilities = [p for p in interval_probabilities if p != 0.0]
-
-        return -1.0 * np.sum([interval_probabilities[i] * np.log2(interval_probabilities[i]) for i in range(self.number_of_intervals)])
-
-    def _evaluate_leaked_information(self, error_rate):
-        if self._lambda:
-            # Use the lambda model
-            return (1.0 + self.lambda_model(error_rate)) * self.m * self._binary_entropy(error_rate)
-        
-        # Use the standard model
-        return self.m * self._binary_entropy(error_rate)
-
-    def _evaluate_slepian_wolf_leaked_information(self, normalised_tau_arr, normalised_g_arr):
-        """
-        Calculate a lower bound on the amount of information leaked on the public channel, using the Slepian-Wolf theorem.
-
-        LEAK = H(S_{1, ..., m}(X) | Y)
-            = H(S_{1, ..., m}(X), Y) - H(Y)
-        """
-
-        # Step 1: Discretize y
+    def evaluate_slepian_wolf_leakage(self, normalised_tau_arr, normalised_g_arr) -> float:
+        """Numerical Slepian-Wolf leakage estimate (placeholder implementation)."""
+        # TODO: integrate the notes formulation more efficiently and expose configuration hooks.
         num_y_points = 1000
         sigma_Y = np.sqrt(self.bob_variance)
         y_min = -5 * sigma_Y
@@ -620,211 +227,201 @@ class GBSR(GBSR_quantum_statistics):
         y_vals = np.linspace(y_min, y_max, num_y_points)
         delta_y = y_vals[1] - y_vals[0]
 
-        # Step 2: Compute p(y)
         p_y = np.array([self._compute_p_y(y_j) for y_j in y_vals])
         epsilon = 1e-12
         p_y = np.clip(p_y, epsilon, None)
 
-        # Step 3: Compute p(s_i, y)
         num_intervals = self.number_of_intervals
         p_s_y = np.zeros((num_intervals, num_y_points))
 
         x_tau_arr = np.sqrt(self.modulation_variance) * np.array(normalised_tau_arr)
 
         for i in range(num_intervals):
-            xlims = [x_tau_arr[i], x_tau_arr[i+1]]
+            xlims = [x_tau_arr[i], x_tau_arr[i + 1]]
             for idx, y_j in enumerate(y_vals):
                 p_s_y[i, idx] = self._integrate_pxy_over_x(xlims, y_j)
 
-        # Step 4: Compute p(s_i | y)
         p_s_given_y = p_s_y / p_y
 
-        # Step 5: Compute H(S | Y = y_j)
         H_S_given_y = np.zeros(num_y_points)
-
         for idx in range(num_y_points):
-            p_s_given_y_j = p_s_given_y[:, idx]
-            p_s_given_y_j = np.clip(p_s_given_y_j, epsilon, None)
+            p_s_given_y_j = np.clip(p_s_given_y[:, idx], epsilon, None)
             H_S_given_y[idx] = -np.sum(p_s_given_y_j * np.log2(p_s_given_y_j))
 
-        # Step 6: Compute H(S|Y)
         H_S_given_Y = np.sum(H_S_given_y * p_y) * delta_y
-
         return H_S_given_Y
-    
-    def _evaluate_holevo_information(self, a, b, c):
-        """
-            An upper bound for the Holevo information using the calculated covariance matrix. 
-            See first-year report or (Laudenbach 2018) for more details.
-            We can directly find the symplectic eigenvalues of the needed covariance matrix by using the familiar formulae.
-        """
-        nu = np.zeros(3)
 
-        sqrt_value = (a + b)**2 - (4.0 * c**2)
+    def _evaluate_marginals(self, normalised_tau_arr, normalised_g_arr,
+                            axis_range=(-10, 10), num_points_on_axis=100):
+        tau_arr = np.sqrt(self.bob_variance) * np.array(normalised_tau_arr)
+        g_arr = np.sqrt(self.bob_variance) * np.array(normalised_g_arr)
 
-        nu[0] = 0.5 * (np.sqrt(sqrt_value) + (b - a))
-        nu[1] = 0.5 * (np.sqrt(sqrt_value) - (b - a))
+        axis_values = np.linspace(axis_range[0], axis_range[1], num_points_on_axis)
 
-        # Find the symplectic eigenvalue of the covariance matrix describing A conditioned on B. (The '+1' is the only effect of heterodyne detection in this code)
-        nu[2] = a - ((c**2) / (b + 1))
+        def filter_function(y):
+            mask = np.ones_like(y, dtype=bool)
+            for i in range(len(tau_arr)):
+                y_minus_tau = y - tau_arr[i]
+                condition = (-g_arr[i][0] <= y_minus_tau) & (y_minus_tau <= g_arr[i][1])
+                mask &= ~condition
+            return mask.astype(int)
 
-        # With all the necessary symplectic eigenvalues, we can now find the Holevo information:
-        return self._g(nu[0]) + self._g(nu[1]) - self._g(nu[2])
+        x_mesh, y_mesh = np.meshgrid(axis_values, axis_values)
+        Q_star_values = self.Q_star_rv.pdf(np.dstack((x_mesh, y_mesh)))
+
+        self.Q_PS_values = filter_function(y_mesh) * Q_star_values
+        self.Q_PS_values /= np.sum(self.Q_PS_values)
+
+        self.px_Q_PS_values = np.sum(self.Q_PS_values, axis=0)
+        self.py_Q_PS_values = np.sum(self.Q_PS_values, axis=1)
+        self.px_Q_PS_values /= np.sum(self.px_Q_PS_values)
+        self.py_Q_PS_values /= np.sum(self.py_Q_PS_values)
+        return self.px_Q_PS_values, self.py_Q_PS_values, self.Q_PS_values
+
+    def _compute_Q_PS_moments(self, rv, normalised_tau_arr, normalised_g_arr):
+        y_tau_arr = np.sqrt(self.bob_variance) * np.array(normalised_tau_arr)
+        y_g_arr = np.sqrt(self.bob_variance) * np.array(normalised_g_arr)
+
+        epsabs = 1e-3
+        epsrel = 1e-3
+
+        def integrand_x2(y, x):
+            return x ** 2 * rv.pdf([x, y])
+
+        def integrand_y2(y, x):
+            return y ** 2 * rv.pdf([x, y])
+
+        def integrand_xy(y, x):
+            return x * y * rv.pdf([x, y])
+
+        xlims = [-np.inf, np.inf]
+        ylims = [-np.inf, np.inf]
+
+        band_ranges = []
+        for i in range(len(y_tau_arr)):
+            band_lower = y_tau_arr[i] - y_g_arr[i][0]
+            band_upper = y_tau_arr[i] + y_g_arr[i][1]
+            band_ranges.append((band_lower, band_upper))
+
+        interval_list = [[ylims[0], ylims[1]]]
+        for band_lower, band_upper in band_ranges:
+            new_intervals = []
+            for start, end in interval_list:
+                if band_upper <= start or band_lower >= end:
+                    new_intervals.append([start, end])
+                    continue
+                if band_lower > start:
+                    new_intervals.append([start, band_lower])
+                if band_upper < end:
+                    new_intervals.append([band_upper, end])
+            interval_list = new_intervals
+
+        if self.progress_bar:
+            interval_iter = tqdm(interval_list)
+        else:
+            interval_iter = interval_list
+
+        E_X2_num = 0.0
+        E_Y2_num = 0.0
+        E_XY_num = 0.0
+        norm_const = 0.0
+
+        for y_start, y_end in interval_iter:
+            if y_end <= y_start:
+                continue
+
+            norm_const += self._integrate_2D_gaussian_pdf(rv, xlims, [y_start, y_end])
+            E_X2_num += dblquad(integrand_x2, xlims[0], xlims[1], lambda x: y_start, lambda x: y_end, epsabs=epsabs, epsrel=epsrel)[0]
+            E_Y2_num += dblquad(integrand_y2, xlims[0], xlims[1], lambda x: y_start, lambda x: y_end, epsabs=epsabs, epsrel=epsrel)[0]
+            E_XY_num += dblquad(integrand_xy, xlims[0], xlims[1], lambda x: y_start, lambda x: y_end, epsabs=epsabs, epsrel=epsrel)[0]
+
+        if norm_const == 0.0:
+            raise ValueError("Normalization constant is zero. Check integration limits and guard bands.")
+
+        var_x = E_X2_num / norm_const
+        var_y = E_Y2_num / norm_const
+        cov_xy = E_XY_num / norm_const
+        return var_x, var_y, cov_xy
+
+    def _integrate_Q_PS(self, xlims, ylims, normalised_tau_arr, normalised_g_arr):
+        y_tau_arr = np.sqrt(self.bob_variance) * np.array(normalised_tau_arr)
+        y_g_arr = np.sqrt(self.bob_variance) * np.array(normalised_g_arr)
+
+        integral_result = 0.0
+        y_lower = ylims[0]
+        y_upper = ylims[1]
+
+        band_ranges = []
+        for i in range(len(y_tau_arr)):
+            band_lower = y_tau_arr[i] - y_g_arr[i][0]
+            band_upper = y_tau_arr[i] + y_g_arr[i][1]
+            band_ranges.append((band_lower, band_upper))
+
+        interval_list = [[y_lower, y_upper]]
+        for band_lower, band_upper in band_ranges:
+            new_intervals = []
+            for start, end in interval_list:
+                if band_upper <= start or band_lower >= end:
+                    new_intervals.append([start, end])
+                    continue
+                if band_lower > start:
+                    new_intervals.append([start, band_lower])
+                if band_upper < end:
+                    new_intervals.append([band_upper, end])
+            interval_list = new_intervals
+
+        for start, end in interval_list:
+            if end > start:
+                integral_result += (1.0 / self.p_pass) * self._integrate_2D_gaussian_pdf(
+                    self.Q_star_rv, xlims, [start, end]
+                )
+
+        return integral_result
+
+    def _leak_from_error_rate(
+        self, *, error_rate: float, coding_efficiency: float | None = None, **_kwargs
+    ) -> float:
+        effective_error = self._effective_bsc_error(error_rate)
+        capacity = self._bsc_capacity(effective_error)
+        if coding_efficiency is None:
+            coding_efficiency = float(
+                self._evaluate_code_efficiency(np.array([effective_error]))[0]
+            )
+        else:
+            coding_efficiency = float(np.asarray(coding_efficiency, dtype=float))
+        leak_per_bit = np.clip(1.0 - coding_efficiency * capacity, 0.0, 1.0)
+        return float(self.m * leak_per_bit)
+
+    def _leak_from_slepian_wolf(self, **_kwargs) -> float:
+        raise NotImplementedError(
+            "Slepian-Wolf leakage computation is not implemented for GBSR yet."
+        )
+
+    def _compute_p_y(self, y_val: float) -> float:
+        return self.py_rv.pdf(y_val)
+
+    def _integrate_pxy_over_x(self, xlims, y_val: float) -> float:
+        """Integrate p(x, y) over the interval xlims for a fixed y value."""
+        var_y = self.cov_mat[1, 1]
+        cov_xy = self.cov_mat[0, 1]
+        var_x = self.cov_mat[0, 0]
+
+        conditional_mean = (cov_xy / var_y) * y_val
+        conditional_var = var_x - (cov_xy ** 2) / var_y
+        conditional_sigma = np.sqrt(max(conditional_var, 1e-12))
+        conditional = norm(loc=conditional_mean, scale=conditional_sigma)
+        probability = conditional.cdf(xlims[1]) - conditional.cdf(xlims[0])
+        return probability * self._compute_p_y(y_val)
 
     def _evaluate_actual_mutual_information(self, normalised_tau_arr, normalised_g_arr):
-        pass
+        """TODO: implement the actual mutual information calculation."""
+        raise NotImplementedError
 
     def _evaluate_postselected_devetak_winter(self, normalised_tau_arr, normalised_g_arr):
+        """TODO: implement the post-selected Devetak-Winter bound."""
         return self._evaluate_actual_mutual_information(normalised_tau_arr, normalised_g_arr) - self.gaussian_attack_holevo_information
 
-    def _g(self, x):
-        """
-            Needed to find the correct contrubution to the Holevo information for each symplectic eigenvalue from the appropriate covariance matrix.
-        """
 
-        # x may be less than one due to integration truncation etc. This is usually unintended, so we can evaluate g(x = 1) which is 0.0.
-        if x <= 1.0:
-            return 0.0
 
-        return ((x + 1.0) / 2.0) * np.log2((x + 1.0) / 2.0) - ((x - 1.0) / 2.0) * np.log2((x - 1.0) / 2.0)
 
-    def _binary_entropy(self, e):
-        """
-            Calculate the binary entropy of a given error rate.
-        """
-        if not 0.0 <= e <= 1.0:
-            print(f"Error rate: {e}")
-            raise ValueError("Error rate e must be between 0 and 1 inclusive.")
 
-        epsilon = 1e-15
-        e = min(max(e, epsilon), 1 - epsilon)
-
-        one_minus_e = 1.0 - e
-        return - (e * np.log2(e)) - (one_minus_e * np.log2(one_minus_e))
-
-    def _generate_gray_bit_assignment(self, m):
-        """
-            Generate the Gray bit assignment for the GBSR protocol.
-            Return an array of bit strings from 0 to 2^m - 1.
-        """
-        bit_strings = []
-
-        for i in range(2**m):
-            # The ith gray code is generated using the formula i ^ (i >> 1)
-            gray_code = i ^ (i >> 1)
-            # Format the gray code into a bit string with 'm' bits
-            bit_strings.append(f'{gray_code:0{m}b}')
-
-        return bit_strings
-    
-    def _generate_binary_bit_assignment(self, m):
-        """
-            Generate the binary bit assignment for the GBSR protocol.
-            Return an array of bit strings from 0 to 2^m - 1.
-        """
-        bit_strings = []
-
-        for i in range(2**m):
-            # Format the number 'i' as a binary string with 'm' bits
-            bit_strings.append(f'{i:0{m}b}')
-
-        return bit_strings
-    
-    def _hamming_distance(self, bit_string_1, bit_string_2):
-        """
-            Calculate the Hamming distance between two bit strings.
-        """
-        return sum([bit_string_1[i] != bit_string_2[i] for i in range(len(bit_string_1))])
-
-class SR(GBSR):
-    """
-    Implements Van Assche et al. sliced reconciliation on top of the
-    Gaussian-band SR machinery already in `GBSR`.
-    """
-
-    def evaluate_key_rate_in_bits_per_pulse(self, tau_arr, g_arr):
-        quantisation_entropy = self.evaluate_quantisation_entropy(tau_arr)
-
-        self.slice_error_rates = self._evaluate_slice_error_rates(tau_arr, g_arr)
-
-        classical_leaked_information = self._evaluate_leaked_information()
-        
-        holevo_information = self._evaluate_holevo_information(self.a, self.b, self.c)
-
-        return quantisation_entropy - classical_leaked_information - holevo_information
-
-    def _evaluate_slice_error_rates(self,
-                                    tau_arr,
-                                    g_arr,
-                                    bit_assignment="Gray"):
-
-        # ---- reproduce the pre-processing that the parent does ------------
-        x_tau_arr = np.sqrt(self.modulation_variance) * np.array(tau_arr)
-        y_tau_arr = np.sqrt(self.bob_variance)       * np.array(tau_arr)
-        y_g_arr   = np.sqrt(self.bob_variance)       * np.array(g_arr)
-
-        if bit_assignment == "Gray":
-            bit_strings = self._generate_gray_bit_assignment(self.m)
-        elif bit_assignment == "binary":
-            bit_strings = self._generate_binary_bit_assignment(self.m)
-        else:
-            raise ValueError("bit_assignment must be 'Gray' or 'binary'")
-
-        # ---- actual slice-wise integration --------------------------------
-        slice_error_rates = np.zeros(self.m)
-
-        for k in range(self.m):                       # loop over bit position
-            e_k = 0.0
-            for i in range(self.number_of_intervals):
-                for j in range(self.number_of_intervals):
-                    if i == j:
-                        continue
-                    # does the k-th slice differ between intervals i and j?
-                    if bit_strings[i][k] != bit_strings[j][k]:
-                        xlims = [x_tau_arr[i],            x_tau_arr[i+1]]
-                        ylims = [y_tau_arr[j] + y_g_arr[j][1],
-                                 y_tau_arr[j+1] - y_g_arr[j+1][0]]
-
-                        e_k += self._integrate_2D_gaussian_pdf(
-                                    self.joint_rv, xlims, ylims)
-
-            slice_error_rates[k] = e_k
-
-        return slice_error_rates
-        
-    # Method override to use the sliced error rates
-    def _evaluate_leaked_information(self):
-        """
-            TODO: This does not take into account the overhead factor (λ) yet. 
-        """
-
-        if not hasattr(self, "slice_error_rates"):
-            raise RuntimeError("Call evaluate_SR_error_rates() first")
-        
-        if self._lambda:
-            return sum(
-                (1.0 + self.lambda_model(ei)) * self._binary_entropy(ei)
-                for ei in self.slice_error_rates
-            )
-
-        return sum(self._binary_entropy(ei)for ei in self.slice_error_rates)
-    
-    def evaluate_error_rate(self, *args, **kwargs):
-        # This method overrides the evaluate_error_rate method in the parent class.
-        pass
-
-if __name__ == "__main__":
-    # Example usage
-
-    gbsr = GBSR(1, 2.2, 0.4, 0.05, progress_bar=True)
-
-    tau_arr = [-np.inf, 0.0, np.inf]
-    g_arr = [
-        [0.0, 0.0],
-        [0.3, 0.3],
-        [0.0, 0.0]
-    ]
-
-    gbsr.plot_Q_marginals(tau_arr, g_arr)
-
-    
