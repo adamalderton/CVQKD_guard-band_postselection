@@ -52,7 +52,7 @@ class SR(KeyEfficiencyBase):
 
         self.gaussian_attack_holevo_information = self._evaluate_holevo_information()
 
-    def evaluate_key_rate_in_bits_per_pulse(self, tau_arr, g_arr=None, *, code_efficiency=None, bit_assignment="Gray") -> float:
+    def evaluate_key_rate_in_bits_per_pulse(self, tau_arr, g_arr=None, *, code_efficiency=None, bit_assignment="binary") -> float:
         metrics = self.evaluate_reconciliation_efficiency(
             tau_arr,
             g_arr,
@@ -61,7 +61,7 @@ class SR(KeyEfficiencyBase):
         )
         return metrics["key_rate"]
 
-    def evaluate_key_rate_components(self, tau_arr, g_arr=None, *, code_efficiency=None, bit_assignment="Gray") -> dict[str, float]:
+    def evaluate_key_rate_components(self, tau_arr, g_arr=None, *, code_efficiency=None, bit_assignment="binary") -> dict[str, float]:
         metrics = self.evaluate_reconciliation_efficiency(
             tau_arr,
             g_arr,
@@ -83,7 +83,7 @@ class SR(KeyEfficiencyBase):
         g_arr=None,
         *,
         code_efficiency=None,
-        bit_assignment="Gray",
+        bit_assignment="binary",
     ) -> dict[str, float]:
         """Return the reconciliation efficiency components for m slices."""
         quantisation_entropy = self.evaluate_quantisation_entropy(tau_arr)
@@ -132,7 +132,7 @@ class SR(KeyEfficiencyBase):
             "I_AB": self.I_AB,
         }
 
-    def _evaluate_slice_error_rates(self, tau_arr, g_arr=None, bit_assignment="Gray"):
+    def _evaluate_slice_error_rates(self, tau_arr, g_arr=None, bit_assignment="binary"):
         """TODO: Change this to multi-round. It might already be????"""
         if g_arr is None:
             g_arr = np.zeros((len(tau_arr), 2))
