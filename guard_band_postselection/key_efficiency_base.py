@@ -255,7 +255,7 @@ class KeyEfficiencyBase(ABC):
 
     def _binary_entropy(self, e: float) -> float:
         if not 0.0 <= e <= 1.0:
-            raise ValueError("Error rate e must be between 0 and 1 inclusive.")
+            raise ValueError(f"Error rate e must be between 0 and 1 inclusive. e = {e}.")
 
         epsilon = 1e-15
         e = min(max(e, epsilon), 1 - epsilon)

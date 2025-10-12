@@ -130,6 +130,7 @@ class SR(KeyEfficiencyBase):
             "quantisation_entropy": float(quantisation_entropy),
             "slices": slice_metrics,
             "I_AB": self.I_AB,
+            "holevo": float(self._holevo_with_qct()),
         }
 
     def _evaluate_slice_error_rates(self, tau_arr, g_arr=None, bit_assignment="binary"):
