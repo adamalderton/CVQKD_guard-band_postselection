@@ -3,10 +3,15 @@ implementation/MrMustard/
 temp.py
 temp.ipynb
 relevant_papers/
+old/
 
 experiments/
 
 .vscode/
+
+# Generated research artifacts
+guard_band_postselection_new/dimension_reduction_development/plots/
+guard_band_postselection_new/plotting_data/
 
 # Byte-compiled / optimized / DLL files
 __pycache__/
