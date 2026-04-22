@@ -12,6 +12,8 @@ experiments/
 # Generated research artifacts
 guard_band_postselection_new/dimension_reduction_development/plots/
 guard_band_postselection_new/plotting_data/
+research/dimension_reduction/plots/
+research/dimension_reduction/generated/
 
 # Byte-compiled / optimized / DLL files
 __pycache__/
